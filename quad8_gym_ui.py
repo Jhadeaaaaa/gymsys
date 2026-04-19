@@ -188,6 +188,63 @@ class RegistrationDatabase:
             )
             return cur.fetchall()
 
+    def get_memberships(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT id, full_name, member_id, protocol_name, cycle_start_date, cycle_expiration_date
+                FROM member_registrations
+                ORDER BY id DESC
+                """
+            )
+            return cur.fetchall()
+
+    def renew_membership(self, registration_id, protocol_name):
+        from datetime import datetime, timedelta
+
+        start_date = datetime.now()
+        if protocol_name == "Weekly":
+            expiration_date = start_date + timedelta(days=7)
+            price = 120
+        else:
+            expiration_date = start_date + timedelta(days=30)
+            price = 350
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE member_registrations
+                SET protocol_name = ?,
+                    protocol_price_php = ?,
+                    cycle_start_date = ?,
+                    cycle_expiration_date = ?
+                WHERE id = ?
+                """,
+                (
+                    protocol_name,
+                    price,
+                    start_date.strftime("%m/%d/%Y"),
+                    expiration_date.strftime("%m/%d/%Y"),
+                    registration_id,
+                ),
+            )
+            conn.commit()
+
+    def cancel_membership(self, registration_id):
+        from datetime import datetime, timedelta
+
+        cancelled_date = (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE member_registrations
+                SET cycle_expiration_date = ?
+                WHERE id = ?
+                """,
+                (cancelled_date, registration_id),
+            )
+            conn.commit()
+
     def find_member_for_checkin(self, search_text):
         token = (search_text or "").strip()
         if not token:
@@ -627,8 +684,9 @@ class Sidebar(QWidget):
         ("⊞", "DASHBOARD", 0),
         ("◈", "RECORD USER", 1),
         ("◉", "REGISTER MEMBER", 2),
-        ("⊡", "CHECK-IN", 3),
-        ("▦", "REPORTS", 4),
+        ("◎", "MEMBERSHIPS", 3),
+        ("⊡", "CHECK-IN", 4),
+        ("▦", "REPORTS", 5),
     ]
 
     def __init__(self, parent=None):
@@ -747,6 +805,12 @@ class TopBar(QWidget):
         lay.addWidget(self.title_lbl)
         lay.addStretch()
 
+        # Live date/time display
+        self.datetime_lbl = QLabel()
+        self.datetime_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
+        lay.addWidget(self.datetime_lbl)
+        lay.addSpacing(12)
+
         # Search
         search = QLineEdit()
         search.setPlaceholderText("Search members, logs...")
@@ -771,12 +835,22 @@ class TopBar(QWidget):
             """)
             lay.addWidget(b)
 
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_datetime)
+        self._clock_timer.start(1000)
+        self._update_datetime()
+
+    def _update_datetime(self):
+        now = QDateTime.currentDateTime().toString("ddd, MMM dd yyyy  hh:mm:ss AP")
+        self.datetime_lbl.setText(now)
+
 
 # ─── STAT CARD ────────────────────────────────────────────────────────────────
 
 class StatCard(QFrame):
     def __init__(self, label, value, sub_text, sub_color="secondary", parent=None):
         super().__init__(parent)
+        self.sub_color = sub_color
         self.setStyleSheet(card_style("surface_container"))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(110)
@@ -789,9 +863,9 @@ class StatCard(QFrame):
         lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 2))
         lay.addWidget(lbl)
 
-        val = QLabel(value)
-        val.setStyleSheet(f"color: {C['on_surface']}; font-family: '{FONT_HEADLINE}'; font-size: 26px; font-weight: 700;")
-        lay.addWidget(val)
+        self.value_lbl = QLabel(value)
+        self.value_lbl.setStyleSheet(f"color: {C['on_surface']}; font-family: '{FONT_HEADLINE}'; font-size: 26px; font-weight: 700;")
+        lay.addWidget(self.value_lbl)
 
         # Ghost big number decoration
         bg_num = QLabel("8")
@@ -803,10 +877,19 @@ class StatCard(QFrame):
         """)
         bg_num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        sub = QLabel(sub_text)
-        sub.setStyleSheet(label_style(9, sub_color, "medium", FONT_BODY))
-        lay.addWidget(sub)
+        self.sub_lbl = QLabel(sub_text)
+        self.sub_lbl.setStyleSheet(label_style(9, self.sub_color, "medium", FONT_BODY))
+        lay.addWidget(self.sub_lbl)
         lay.addStretch()
+
+    def set_value(self, value):
+        self.value_lbl.setText(str(value))
+
+    def set_sub_text(self, sub_text, sub_color=None):
+        if sub_color:
+            self.sub_color = sub_color
+            self.sub_lbl.setStyleSheet(label_style(9, self.sub_color, "medium", FONT_BODY))
+        self.sub_lbl.setText(sub_text)
 
 
 # ─── ACTIVITY ROW ─────────────────────────────────────────────────────────────
@@ -1025,8 +1108,10 @@ class LoginPage(QWidget):
 # ─── PAGE: DASHBOARD ──────────────────────────────────────────────────────────
 
 class DashboardPage(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, db, parent=None):
         super().__init__(parent)
+        self.db = db
+        self.stat_cards = {}
         self.setStyleSheet(f"background: {C['background']};")
         self._build()
 
@@ -1050,13 +1135,15 @@ class DashboardPage(QWidget):
         stats = [
             ("TOTAL MEMBERS", "1,240", "↑ +12% THIS MONTH", "secondary"),
             ("TODAY'S CHECK-INS", "85", "⚡ PEAK CAPACITY: 82%", "primary"),
-            ("ACTIVE MEMBERSHIPS", "982", "⚠ 12 RENEWALS PENDING", "tertiary"),
+            ("ACTIVE MEMBERSHIPS", "0", "⚠ 0 RENEWALS PENDING", "tertiary"),
             ("MONTHLY REVENUE", php_currency(42850), f"🎯 TARGET: {php_currency(45000)}", "secondary"),
         ]
         for label, val, sub, col in stats:
             card = StatCard(label, val, sub, col)
+            self.stat_cards[label] = card
             stat_row.addWidget(card)
         lay.addLayout(stat_row)
+        self.refresh_dashboard_metrics()
 
         # Mid row: chart + activity
         mid_row = QHBoxLayout()
@@ -1197,6 +1284,49 @@ class DashboardPage(QWidget):
         bot_row.addWidget(ret_card, 2)
         lay.addLayout(bot_row)
         lay.addStretch()
+
+    def _resolve_expiry_date(self, start_date, protocol_name, expiration_date):
+        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        if expiry.isValid():
+            return expiry
+
+        start = QDate.fromString(start_date or "", "MM/dd/yyyy")
+        if not start.isValid():
+            return QDate()
+
+        if protocol_name == "Weekly":
+            return start.addDays(7)
+        return start.addMonths(1)
+
+    def _get_active_membership_metrics(self):
+        today = QDate.currentDate()
+        active_members = 0
+        renewals_pending = 0
+
+        with sqlite3.connect(self.db.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT cycle_start_date, protocol_name, cycle_expiration_date
+                FROM member_registrations
+                """
+            )
+            for start_date, protocol_name, expiration_date in cur.fetchall():
+                expiry = self._resolve_expiry_date(start_date, protocol_name, expiration_date)
+                if not expiry.isValid():
+                    continue
+                if today <= expiry:
+                    active_members += 1
+                    if today.daysTo(expiry) <= 7:
+                        renewals_pending += 1
+
+        return active_members, renewals_pending
+
+    def refresh_dashboard_metrics(self):
+        active_members, renewals_pending = self._get_active_membership_metrics()
+        active_card = self.stat_cards.get("ACTIVE MEMBERSHIPS")
+        if active_card:
+            active_card.set_value(f"{active_members:,}")
+            active_card.set_sub_text(f"⚠ {renewals_pending} RENEWALS PENDING")
 
 
 # ─── PAGE: REGISTER MEMBER ────────────────────────────────────────────────────
@@ -2616,6 +2746,215 @@ class QRCheckInPage(QWidget):
         lay.addLayout(right, 2)
 
 
+# ─── PAGE: MEMBERSHIPS ───────────────────────────────────────────────────────
+
+class MembershipPage(QWidget):
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.membership_records = []
+        self.setStyleSheet(f"background: {C['background']};")
+        self._build()
+        self.refresh_memberships()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(14)
+
+        title_row = QHBoxLayout()
+        title = QLabel("◎  MEMBERSHIP MANAGEMENT")
+        title.setStyleSheet(label_style(24, "on_surface", "bold", FONT_HEADLINE, 1))
+        self.count_lbl = QLabel("0 members")
+        self.count_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_HEADLINE, 1))
+        title_row.addWidget(title)
+        title_row.addStretch()
+        title_row.addWidget(self.count_lbl)
+        lay.addLayout(title_row)
+
+        controls = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search member by name or ID...")
+        self.search_input.setFixedHeight(38)
+        self.search_input.setFixedWidth(340)
+        self.search_input.setStyleSheet(input_style())
+        self.search_input.textChanged.connect(self.refresh_memberships)
+        controls.addWidget(self.search_input)
+
+        controls.addSpacing(16)
+        plan_lbl = QLabel("RENEW PLAN:")
+        plan_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_HEADLINE, 1))
+        controls.addWidget(plan_lbl)
+
+        self.plan_combo = QComboBox()
+        self.plan_combo.addItems(["Weekly", "Monthly"])
+        self.plan_combo.setFixedHeight(38)
+        self.plan_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C['surface_container_lowest']};
+                color: {C['on_surface']};
+                border: 1px solid {C['outline_variant']}66;
+                border-radius: 4px;
+                padding: 8px 12px;
+                min-width: 120px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: {C['surface_container']};
+                color: {C['on_surface']};
+                selection-background-color: {C['primary_container']};
+            }}
+        """)
+        controls.addWidget(self.plan_combo)
+
+        controls.addSpacing(8)
+        renew_btn = QPushButton("RENEW")
+        renew_btn.setFixedHeight(38)
+        renew_btn.setStyleSheet(btn_primary_style())
+        renew_btn.clicked.connect(self._renew_selected)
+        controls.addWidget(renew_btn)
+
+        cancel_btn = QPushButton("CANCEL PLAN")
+        cancel_btn.setFixedHeight(38)
+        cancel_btn.setStyleSheet(btn_secondary_style())
+        cancel_btn.clicked.connect(self._cancel_selected)
+        controls.addWidget(cancel_btn)
+
+        refresh_btn = QPushButton("REFRESH")
+        refresh_btn.setFixedHeight(38)
+        refresh_btn.setStyleSheet(btn_secondary_style())
+        refresh_btn.clicked.connect(self.refresh_memberships)
+        controls.addWidget(refresh_btn)
+        controls.addStretch()
+
+        lay.addLayout(controls)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Name", "Member ID", "Plan", "Start Date", "Expiration Date", "Status"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {C['surface_container']};
+                alternate-background-color: {C['surface_container_low']};
+                color: {C['on_surface']};
+                border: 1px solid {C['outline_variant']}66;
+                border-radius: 6px;
+                gridline-color: {C['outline_variant']}44;
+                font-size: 11px;
+            }}
+            QHeaderView::section {{
+                background: {C['surface_container_high']};
+                color: {C['on_surface_variant']};
+                border: none;
+                border-bottom: 1px solid {C['outline_variant']}66;
+                padding: 8px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+        """)
+        lay.addWidget(self.table)
+
+    def _membership_status(self, expiration_date):
+        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        if not expiry.isValid():
+            return "INACTIVE"
+        return "ACTIVE" if QDate.currentDate() <= expiry else "INACTIVE"
+
+    def _selected_record(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.membership_records):
+            return None
+        return self.membership_records[row]
+
+    def refresh_memberships(self):
+        token = self.search_input.text().lower().strip()
+        records = self.db.get_memberships()
+        self.membership_records = []
+
+        for rec in records:
+            reg_id, name, member_id, plan, start_date, expiration_date = rec
+            searchable = f"{name} {member_id or ''}".lower()
+            if token and token not in searchable:
+                continue
+            status = self._membership_status(expiration_date)
+            self.membership_records.append((
+                reg_id, name, member_id, plan, start_date, expiration_date, status
+            ))
+
+        self.table.setRowCount(len(self.membership_records))
+        self.count_lbl.setText(f"{len(self.membership_records)} members")
+
+        for r, rec in enumerate(self.membership_records):
+            reg_id, name, member_id, plan, start_date, expiration_date, status = rec
+            values = [
+                name,
+                member_id or "--",
+                plan or "--",
+                start_date or "--",
+                expiration_date or "--",
+                status,
+            ]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if c == 5:
+                    item.setForeground(QColor(C["secondary"] if status == "ACTIVE" else C["tertiary"]))
+                self.table.setItem(r, c, item)
+
+    def _renew_selected(self):
+        rec = self._selected_record()
+        if not rec:
+            QMessageBox.warning(self, "No Selection", "Select a member to renew membership plan.")
+            return
+
+        reg_id, name, member_id, *_ = rec
+        plan = self.plan_combo.currentText()
+        answer = QMessageBox.question(
+            self,
+            "Confirm Renewal",
+            f"Renew {name} ({member_id}) to {plan} plan?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.db.renew_membership(reg_id, plan)
+        QMessageBox.information(self, "Membership Renewed", f"{name} renewed successfully under {plan} plan.")
+        self.refresh_memberships()
+
+    def _cancel_selected(self):
+        rec = self._selected_record()
+        if not rec:
+            QMessageBox.warning(self, "No Selection", "Select a member to cancel membership plan.")
+            return
+
+        reg_id, name, member_id, *_ = rec
+        answer = QMessageBox.question(
+            self,
+            "Confirm Cancellation",
+            f"Cancel membership plan for {name} ({member_id})?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.db.cancel_membership(reg_id)
+        QMessageBox.information(self, "Membership Cancelled", f"{name} membership plan cancelled.")
+        self.refresh_memberships()
+
+
 # ─── PAGE: REPORTS ────────────────────────────────────────────────────────────
 
 class ReportsPage(QWidget):
@@ -3099,11 +3438,11 @@ class RecordUserPage(QWidget):
         self.current_filter = filter_type
         
         # Update table columns based on filter type
-        if filter_type == "MEMBERSHIP":
-            # Membership: show Name, Member ID, Start Date, Expiration Date, Station
+        if filter_type == "MEMBERSHIP": 
+            # Membership: show Name, Member ID, Start Date, Expiration Date, Status
             self.table.setColumnCount(5)
             self.table.setHorizontalHeaderLabels([
-                "Name", "Member ID", "Start Date", "Expiration Date", "Station",
+                "Name", "Member ID", "Start Date", "Expiration Date", "Status",
             ])
             self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -3125,6 +3464,12 @@ class RecordUserPage(QWidget):
         
         self.refresh_records()
 
+    def _membership_status(self, expiration_date):
+        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        if not expiry.isValid():
+            return "INACTIVE"
+        return "ACTIVE" if QDate.currentDate() <= expiry else "INACTIVE"
+
     def refresh_records(self):
         # Get records from database based on filter
         search_text = self.search_input.text().lower().strip()
@@ -3135,7 +3480,7 @@ class RecordUserPage(QWidget):
                 # Show all registered members with their start and expiration dates
                 cur = conn.execute(
                     """
-                    SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                    SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, id
                     FROM member_registrations
                     ORDER BY id DESC
                     """
@@ -3187,8 +3532,8 @@ class RecordUserPage(QWidget):
         for rec in all_records:
             # Unpack based on filter type
             if self.current_filter == "MEMBERSHIP":
-                # MEMBERSHIP: id, name, member_id, start_date, expiration_date, station, reg_id
-                rec_id, name, member_id, start_date, expiration_date, station, reg_id = rec
+                # MEMBERSHIP: id, name, member_id, start_date, expiration_date, reg_id
+                rec_id, name, member_id, start_date, expiration_date, reg_id = rec
             else:
                 # ALL and WALKIN: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
                 checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id = rec
@@ -3204,15 +3549,16 @@ class RecordUserPage(QWidget):
         for r, rec in enumerate(filtered_records):
             # Display based on filter type - records have different structures
             if self.current_filter == "MEMBERSHIP":
-                # MEMBERSHIP filter records: id, name, member_id, start_date, expiration_date, station, reg_id
-                rec_id, name, member_id, start_date, expiration_date, station, reg_id = rec
+                # MEMBERSHIP filter records: id, name, member_id, start_date, expiration_date, reg_id
+                rec_id, name, member_id, start_date, expiration_date, reg_id = rec
+                status = self._membership_status(expiration_date)
                 
                 values = [
                     name,
                     member_id or "--",
                     start_date or "--",
                     expiration_date or "--",
-                    station,
+                    status,
                 ]
             else:
                 # ALL and WALKIN filter records: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
@@ -3289,13 +3635,21 @@ class MainWindow(QMainWindow):
         self.page_stack.setStyleSheet(f"background: {C['background']};")
 
         self.pages = [
-            DashboardPage(),
+            DashboardPage(self.db),
             RecordUserPage(self.db),
             RegisterPage(self.db),
+            MembershipPage(self.db),
             QRCheckInPage(self.db),
             ReportsPage(),
         ]
-        page_titles = ["Command Center", "Record User", "Register Protocol", "Daily Check-In", "Performance Intelligence"]
+        page_titles = [
+            "Command Center",
+            "Record User",
+            "Register Protocol",
+            "Membership Management",
+            "Daily Check-In",
+            "Performance Intelligence",
+        ]
         for p in self.pages:
             self.page_stack.addWidget(p)
 
@@ -3308,12 +3662,17 @@ class MainWindow(QMainWindow):
 
     def _on_login(self):
         self.root_stack.setCurrentIndex(1)
+        self.pages[0].refresh_dashboard_metrics()
 
     def _on_nav(self, idx):
         self.page_stack.setCurrentIndex(idx)
         self.top_bar.title_lbl.setText(self._page_titles[idx])
+        if idx == 0:
+            self.pages[0].refresh_dashboard_metrics()
         if idx == 1:
             self.pages[1].refresh_records()
+        if idx == 3:
+            self.pages[3].refresh_memberships()
 
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
