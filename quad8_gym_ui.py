@@ -20,6 +20,7 @@ from PyQt6.QtGui import (
     QRadialGradient, QFontDatabase, QPainterPath, QPixmap,
     QIcon, QPalette, QPdfWriter, QPageSize
 )
+from PyQt6.QtSvg import QSvgRenderer
 
 # ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
 C = {
@@ -622,6 +623,7 @@ def nav_btn_style(active=False):
 
 class Sidebar(QWidget):
     nav_changed = pyqtSignal(int)
+    logout_requested = pyqtSignal()
 
     NAV_ITEMS = [
         ("⊞", "DASHBOARD", 0),
@@ -648,44 +650,15 @@ class Sidebar(QWidget):
         logo_frame.setFixedHeight(160)
         logo_frame.setStyleSheet(f"background: {C['surface_container_low']}; border: none;")
         logo_lay = QVBoxLayout(logo_frame)
-        logo_lay.setContentsMargins(16, 20, 16, 16)
-        logo_lay.setSpacing(4)
+        logo_lay.setContentsMargins(16, 24, 16, 24)
+        logo_lay.setSpacing(0)
+        logo_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Logo circle placeholder
-        logo_box = QFrame()
-        logo_box.setFixedSize(60, 60)
-        logo_box.setStyleSheet(f"""
-            background: {C['primary_container']};
-            border-radius: 8px;
-        """)
-        logo_inner = QVBoxLayout(logo_box)
-        logo_inner.setContentsMargins(0, 0, 0, 0)
-        logo_lbl = QLabel("Q8")
-        logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo_lbl.setStyleSheet(f"color: {C['primary']}; font-family: '{FONT_HEADLINE}'; font-size: 16px; font-weight: 800;")
-        logo_inner.addWidget(logo_lbl)
-
-        name_lbl = QLabel("Quad 8\nGYM")
-        name_lbl.setStyleSheet(f"color: {C['primary']}; font-family: '{FONT_HEADLINE}'; font-size: 13px; font-weight: 700; line-height: 1.2;")
-
-        sub_lbl = QLabel("KINETIC\nENGINE")
-        sub_lbl.setStyleSheet(f"color: {C['secondary']}; font-family: '{FONT_HEADLINE}'; font-size: 8px; font-weight: 600; letter-spacing: 2px;")
-
-        hrow = QHBoxLayout()
-        hrow.addWidget(logo_box)
-        vt = QVBoxLayout()
-        vt.setSpacing(2)
-        vt.addWidget(name_lbl)
-        vt.addWidget(sub_lbl)
-        hrow.addLayout(vt)
-        hrow.addStretch()
-        logo_lay.addLayout(hrow)
-
-        # New Workout button
-        nw_btn = QPushButton("+ NEW WORKOUT")
-        nw_btn.setFixedHeight(38)
-        nw_btn.setStyleSheet(btn_primary_style())
-        logo_lay.addWidget(nw_btn)
+        # Welcome admin text - professional style
+        welcome_lbl = QLabel("Welcome\nAdmin")
+        welcome_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_lbl.setStyleSheet(f"color: {C['primary']}; font-family: '{FONT_HEADLINE}'; font-size: 24px; font-weight: 700; line-height: 1.3;")
+        logo_lay.addWidget(welcome_lbl)
 
         layout.addWidget(logo_frame)
 
@@ -713,11 +686,50 @@ class Sidebar(QWidget):
         div2.setStyleSheet(f"background: {C['outline_variant']}30;")
         layout.addWidget(div2)
 
-        for txt in ["? SUPPORT", "→ LOGOUT"]:
-            b = QPushButton(f"  {txt}")
-            b.setFixedHeight(40)
-            b.setStyleSheet(nav_btn_style(False))
-            layout.addWidget(b)
+        support_btn = QPushButton("  ? SUPPORT")
+        support_btn.setFixedHeight(40)
+        support_btn.setStyleSheet(nav_btn_style(False))
+        layout.addWidget(support_btn)
+        
+        self.logout_btn = QPushButton("  → LOGOUT")
+        self.logout_btn.setFixedHeight(40)
+        self.logout_btn.setStyleSheet(nav_btn_style(False))
+        self.logout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.logout_btn.clicked.connect(self.show_logout_dialog)
+        layout.addWidget(self.logout_btn)
+
+    def show_logout_dialog(self):
+        """Show logout confirmation dialog"""
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Logout")
+        dialog.setText("Are you sure you want to logout?")
+        dialog.setStyleSheet(f"""
+            QMessageBox {{
+                background: {C['surface_container']};
+            }}
+            QMessageBox QLabel {{
+                color: {C['on_surface']};
+            }}
+            QPushButton {{
+                background: {C['secondary']};
+                color: {C['on_secondary']};
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+                padding: 6px 16px;
+                border: none;
+                border-radius: 4px;
+                min-width: 60px;
+            }}
+            QPushButton:hover {{
+                background: #9de896;
+            }}
+        """)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        
+        if dialog.exec() == QMessageBox.StandardButton.Yes:
+            self.logout_requested.emit()
 
     def _nav(self, idx):
         self.current = idx
@@ -858,6 +870,98 @@ class ActivityRow(QFrame):
 
 # ─── PAGE: LOGIN ──────────────────────────────────────────────────────────────
 
+def create_icon_pixmap(icon_type="lock", size=24, color="#88d982"):
+    """Create SVG-based icons"""
+    svg_icons = {
+        "lock": f"""<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <rect x="5" y="11" width="14" height="10" rx="2" fill="none" stroke="{color}" stroke-width="1.5"/>
+            <path d="M7 11V7C7 4.24 9.24 2 12 2C14.76 2 17 4.24 17 7V11" stroke="{color}" stroke-width="1.5" fill="none"/>
+            <circle cx="12" cy="16" r="1.5" fill="{color}"/>
+        </svg>""",
+        "eye": f"""<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 4C7 4 2.73 7.11 1 11.46C2.73 15.89 7 19 12 19C17 19 21.27 15.89 23 11.46C21.27 7.11 17 4 12 4Z" fill="none" stroke="{color}" stroke-width="1.5"/>
+            <circle cx="12" cy="11" r="2.5" fill="{color}"/>
+        </svg>"""
+    }
+    
+    svg = svg_icons.get(icon_type, svg_icons["lock"])
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    
+    svg_bytes = svg.encode('utf-8')
+    
+    painter = QPainter(pixmap)
+    renderer = QSvgRenderer(svg_bytes)
+    renderer.render(painter)
+    painter.end()
+    
+    return pixmap
+
+
+class PasswordInput(QWidget):
+    """Custom password input with visibility toggle"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.password_visible = False
+        self._build()
+
+    def _build(self):
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Password input field
+        self.input = QLineEdit()
+        self.input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input.setFixedHeight(40)
+        self.input.setStyleSheet(input_style())
+        lay.addWidget(self.input)
+
+        # Eye toggle button with icon
+        self.eye_btn = QPushButton()
+        self.eye_btn.setFixedSize(40, 40)
+        self.eye_btn.setIcon(QIcon(create_icon_pixmap("lock", 20, C["secondary"])))
+        self.eye_btn.setIconSize(QSize(20, 20))
+        self.eye_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C['surface_container_lowest']};
+                border: none;
+                padding: 0px;
+                border-radius: 2px;
+                margin-left: -2px;
+            }}
+            QPushButton:hover {{
+                background: {C['surface_container_high']};
+            }}
+            QPushButton:pressed {{
+                background: {C['primary_container']};
+            }}
+        """)
+        self.eye_btn.clicked.connect(self.toggle_visibility)
+        lay.addWidget(self.eye_btn)
+
+    def toggle_visibility(self):
+        self.password_visible = not self.password_visible
+        if self.password_visible:
+            self.input.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.eye_btn.setIcon(QIcon(create_icon_pixmap("eye", 20, C["secondary"])))
+        else:
+            self.input.setEchoMode(QLineEdit.EchoMode.Password)
+            self.eye_btn.setIcon(QIcon(create_icon_pixmap("lock", 20, C["secondary"])))
+
+    def setText(self, text):
+        self.input.setText(text)
+
+    def text(self):
+        return self.input.text()
+
+    def setPlaceholderText(self, text):
+        self.input.setPlaceholderText(text)
+
+    def returnPressed(self):
+        return self.input.returnPressed
+
+
 class LoginPage(QWidget):
     login_success = pyqtSignal()
 
@@ -942,45 +1046,41 @@ class LoginPage(QWidget):
         card_lay.addSpacing(8)
 
         # Username
-        u_lbl = QLabel("👤  OPERATOR ID")
-        u_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 3))
-        self.username = QLineEdit("admin")
-        self.username.setFixedHeight(42)
+        u_lbl = QLabel("Username")
+        u_lbl.setStyleSheet(label_style(12, "on_surface_variant", "medium", FONT_HEADLINE, 3))
+        self.username = QLineEdit()
+        self.username.setPlaceholderText("Enter your username")
+        self.username.setFixedHeight(40)
         self.username.setStyleSheet(input_style())
         card_lay.addWidget(u_lbl)
         card_lay.addWidget(self.username)
 
-        # Password
-        p_lbl = QLabel("🔒  ACCESS CODE")
-        p_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 3))
-        self.password = QLineEdit("admin123")
-        self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setFixedHeight(42)
-        self.password.setStyleSheet(input_style())
+        # Password with toggle
+        p_lbl = QLabel("Password")
+        p_lbl.setStyleSheet(label_style(12, "on_surface_variant", "medium", FONT_HEADLINE, 3))
+        self.password = PasswordInput()
+        self.password.setPlaceholderText("Enter your password")
+        self.password.setFixedHeight(40)
         card_lay.addWidget(p_lbl)
         card_lay.addWidget(self.password)
 
         card_lay.addSpacing(8)
 
         # Login button
-        login_btn = QPushButton("INITIALIZE ENGINE  ⚡")
+        login_btn = QPushButton("Login")
         login_btn.setFixedHeight(48)
         login_btn.setStyleSheet(btn_primary_style())
-        login_btn.clicked.connect(self.login_success.emit)
-        self.password.returnPressed.connect(self.login_success.emit)
+        login_btn.clicked.connect(self.validate_login)
+        self.password.returnPressed().connect(self.validate_login)
         card_lay.addWidget(login_btn)
+        card_lay.addSpacing(12)
 
-        # Footer
-        footer = QHBoxLayout()
-        reset = QPushButton("RESET PROTOCOL")
-        reset.setStyleSheet(f"background: transparent; color: {C['on_surface_variant']}; font-family: '{FONT_BODY}'; font-size: 9px; letter-spacing: 2px; border: none;")
-        footer.addWidget(reset)
-        footer.addStretch()
-        for sym in ["⊟", "⊞"]:
-            ic = QLabel(sym)
-            ic.setStyleSheet(label_style(14, "on_surface_variant"))
-            footer.addWidget(ic)
-        card_lay.addLayout(footer)
+        # Error message label
+        self.error_msg = QLabel("")
+        self.error_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.error_msg.setStyleSheet(f"color: {C['error']}; font-family: '{FONT_BODY}'; font-size: 11px; margin-top: 4px;")
+        self.error_msg.setVisible(False)
+        card_lay.addWidget(self.error_msg)
 
         lay.addWidget(card)
         lay.addSpacing(48)
@@ -1021,14 +1121,221 @@ class LoginPage(QWidget):
         corner.setStyleSheet(f"color: {C['primary']}; font-family: '{FONT_HEADLINE}'; font-size: 8px; letter-spacing: 3px;")
         outer.addWidget(corner, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
 
+    def validate_login(self):
+        """Validate username and password"""
+        username = self.username.text().strip()
+        password = self.password.text().strip()
+        
+        # Correct credentials
+        valid_username = "admin"
+        valid_password = "admin123"
+        
+        if username == valid_username and password == valid_password:
+            self.error_msg.setVisible(False)
+            self.login_success.emit()
+        else:
+            self.error_msg.setText("Invalid username or password")
+            self.error_msg.setVisible(True)
+
 
 # ─── PAGE: DASHBOARD ──────────────────────────────────────────────────────────
 
 class DashboardPage(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, db=None, parent=None):
         super().__init__(parent)
+        self.db = db
         self.setStyleSheet(f"background: {C['background']};")
         self._build()
+        # Keep dashboard data fresh while the app is open.
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.update_stats)
+        self.refresh_timer.start(3000)
+
+    def get_overall_checkins(self):
+        """Get total overall activity (all check-ins + all registrations)."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM daily_checkins) +
+                        (SELECT COUNT(*) FROM member_registrations)
+                    """
+                )
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            print(f"Error in get_overall_checkins: {e}")
+            return 0
+
+    def get_weekly_checkins(self):
+        """Get total members enrolled in Weekly membership plan."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM member_registrations WHERE protocol_name = ?",
+                    ("Weekly",)
+                )
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            print(f"Error in get_weekly_checkins: {e}")
+            return 0
+
+    def get_monthly_checkins(self):
+        """Get total members enrolled in Monthly membership plan."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM member_registrations WHERE protocol_name = ?",
+                    ("Monthly",)
+                )
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            print(f"Error in get_monthly_checkins: {e}")
+            return 0
+
+    def get_today_checkins(self, period="Overall"):
+        """Get today's activity by selected period.
+
+        Weekly/Monthly: activity for the selected membership plan only.
+        Overall: combined activity for both Weekly and Monthly plans.
+        """
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            from datetime import datetime
+            today_iso = datetime.now().strftime("%Y-%m-%d")
+            today_us = datetime.now().strftime("%m/%d/%Y")
+            with sqlite3.connect(self.db.db_path) as conn:
+                if period == "Weekly":
+                    protocol_filter = "Weekly"
+                elif period == "Monthly":
+                    protocol_filter = "Monthly"
+                else:
+                    protocol_filter = None
+
+                if protocol_filter:
+                    cur = conn.execute(
+                        """
+                        SELECT
+                            (
+                                SELECT COUNT(*)
+                                FROM daily_checkins dc
+                                JOIN member_registrations mr ON mr.id = dc.registration_id
+                                WHERE (dc.checkin_date LIKE ? OR dc.checkin_date LIKE ?)
+                                  AND mr.protocol_name = ?
+                            )
+                            +
+                            (
+                                SELECT COUNT(*)
+                                FROM member_registrations
+                                WHERE (created_at LIKE ? OR created_at LIKE ?)
+                                  AND protocol_name = ?
+                            )
+                        """,
+                        (
+                            f"{today_iso}%",
+                            f"{today_us}%",
+                            protocol_filter,
+                            f"{today_iso}%",
+                            f"{today_us}%",
+                            protocol_filter,
+                        ),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT
+                            (
+                                SELECT COUNT(*)
+                                FROM daily_checkins dc
+                                JOIN member_registrations mr ON mr.id = dc.registration_id
+                                WHERE (dc.checkin_date LIKE ? OR dc.checkin_date LIKE ?)
+                                  AND mr.protocol_name IN ('Weekly', 'Monthly')
+                            )
+                            +
+                            (
+                                SELECT COUNT(*)
+                                FROM member_registrations
+                                WHERE (created_at LIKE ? OR created_at LIKE ?)
+                                  AND protocol_name IN ('Weekly', 'Monthly')
+                            )
+                        """,
+                        (
+                            f"{today_iso}%",
+                            f"{today_us}%",
+                            f"{today_iso}%",
+                            f"{today_us}%",
+                        ),
+                    )
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            print(f"Error in get_today_checkins: {e}")
+            return 0
+
+    def update_stats(self, period="Overall"):
+        """Update stat cards based on selected period"""
+        # Always fetch fresh data from database
+        overall = self.get_overall_checkins()
+        weekly = self.get_weekly_checkins()
+        monthly = self.get_monthly_checkins()
+        # Today metric follows the selected period.
+        if hasattr(self, 'period_combo'):
+            selected_period = self.period_combo.currentText()
+        else:
+            selected_period = period or "Overall"
+        today_checkins = self.get_today_checkins(selected_period)
+        
+        # Clear existing cards completely
+        while self.stat_row.count() > 0:
+            item = self.stat_row.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        
+        # Get current period - use parameter or combo box
+        if hasattr(self, 'period_combo'):
+            current_period = self.period_combo.currentText()
+        else:
+            current_period = period or "Overall"
+        
+        if current_period == "Weekly":
+            stats = [
+                ("WEEKLY CHECKIN", str(weekly), f"↑ {weekly} MEMBERS", "secondary"),
+                ("TODAY'S CHECK-INS", str(today_checkins), "WEEKLY PLAN TODAY", "primary"),
+                ("TREND", f"↑ {max(0, weekly - 5)}%", "⚠ COMPARED TO LAST WEEK", "tertiary"),
+                ("MONTHLY REVENUE", php_currency(42850), f"🎯 TARGET: {php_currency(45000)}", "secondary"),
+            ]
+        elif current_period == "Monthly":
+            stats = [
+                ("MONTHLY CHECKIN", str(monthly), f"↑ {monthly} MEMBERS", "secondary"),
+                ("TODAY'S CHECK-INS", str(today_checkins), "MONTHLY PLAN TODAY", "primary"),
+                ("AVERAGE/DAY", str(monthly // 30), " 30 DAYS TRACKING", "tertiary"),
+                ("MONTHLY REVENUE", php_currency(42850), f"TARGET: {php_currency(45000)}", "secondary"),
+            ]
+        else:  # Overall
+            stats = [
+                ("OVERALL CHECKIN", str(overall), f"↑ {weekly} THIS WEEK", "secondary"),
+                ("TODAY'S CHECK-INS", str(today_checkins), "WEEKLY + MONTHLY TOTAL TODAY", "primary"),
+                ("MONTHLY CHECKINS", str(monthly), "30 DAYS TRACKING", "tertiary"),
+                ("MONTHLY REVENUE", php_currency(42850), f" TARGET: {php_currency(45000)}", "secondary"),
+            ]
+        
+        for label, val, sub, col in stats:
+            card = StatCard(label, val, sub, col)
+            self.stat_row.addWidget(card)
 
     def _build(self):
         scroll = QScrollArea(self)
@@ -1044,19 +1351,71 @@ class DashboardPage(QWidget):
         lay.setContentsMargins(24, 24, 24, 24)
         lay.setSpacing(20)
 
+        # Period filter
+        filter_row = QHBoxLayout()
+        filter_row.addStretch()
+        
+        period_lbl = QLabel("Period: ")
+        period_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_BODY))
+        filter_row.addWidget(period_lbl)
+        
+        self.period_combo = QComboBox()
+        self.period_combo.addItems(["Overall", "Weekly", "Monthly"])
+        self.period_combo.setFixedWidth(130)
+        self.period_combo.setFixedHeight(32)
+        self.period_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                padding-right: 4px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+                background: transparent;
+                border-left: 1px solid {C['outline_variant']};
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border: none;
+                width: 12px;
+                height: 8px;
+                background: transparent;
+                margin-right: 4px;
+            }}
+            QComboBox::down-arrow:on {{
+                top: 2px;
+            }}
+            QAbstractItemView {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                selection-background-color: {C['primary_container']};
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                outline: none;
+            }}
+            QAbstractItemView::item:hover {{
+                background-color: {C['surface_container_high']};
+            }}
+            QAbstractItemView::item:selected {{
+                background-color: {C['primary_container']};
+                color: {C['on_primary']};
+            }}
+        """)
+        self.period_combo.currentTextChanged.connect(self.update_stats)
+        filter_row.addWidget(self.period_combo)
+        lay.addLayout(filter_row)
+
         # Stat cards row
-        stat_row = QHBoxLayout()
-        stat_row.setSpacing(12)
-        stats = [
-            ("TOTAL MEMBERS", "1,240", "↑ +12% THIS MONTH", "secondary"),
-            ("TODAY'S CHECK-INS", "85", "⚡ PEAK CAPACITY: 82%", "primary"),
-            ("ACTIVE MEMBERSHIPS", "982", "⚠ 12 RENEWALS PENDING", "tertiary"),
-            ("MONTHLY REVENUE", php_currency(42850), f"🎯 TARGET: {php_currency(45000)}", "secondary"),
-        ]
-        for label, val, sub, col in stats:
-            card = StatCard(label, val, sub, col)
-            stat_row.addWidget(card)
-        lay.addLayout(stat_row)
+        self.stat_row = QHBoxLayout()
+        self.stat_row.setSpacing(12)
+        self.update_stats()
+        lay.addLayout(self.stat_row)
 
         # Mid row: chart + activity
         mid_row = QHBoxLayout()
@@ -1202,6 +1561,8 @@ class DashboardPage(QWidget):
 # ─── PAGE: REGISTER MEMBER ────────────────────────────────────────────────────
 
 class RegisterPage(QWidget):
+    registration_completed = pyqtSignal()  # Signal emitted when a member is successfully registered
+    
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
@@ -1697,6 +2058,9 @@ class RegisterPage(QWidget):
         self.member_status = "PENDING ACTIVATION"
         self.status_value_lbl.setText(self.member_status)
         self._select_protocol("Monthly")
+        
+        # Emit signal to refresh dashboard
+        self.registration_completed.emit()
 
     def _export_member_card_pdf(self):
         default_file = f"member_card_{self.member_id_value_lbl.text().replace(' ', '_').replace(':', '')}.pdf"
@@ -2131,6 +2495,8 @@ class DailyCheckInPage(QWidget):
 # ─── PAGE: CHECK-IN ───────────────────────────────────────────────────────────
 
 class QRCheckInPage(QWidget):
+    checkin_completed = pyqtSignal()  # Signal emitted when a successful check-in is made
+    
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
@@ -2251,6 +2617,8 @@ class QRCheckInPage(QWidget):
             self.scan_input.clear()
             self._update_walkin_id_preview("")
             self._update_membership_id_preview("")
+            # Emit signal to refresh record user page
+            self.checkin_completed.emit()
             return
 
         self._set_access_style("already", "Walk-in already checked in today")
@@ -2297,6 +2665,8 @@ class QRCheckInPage(QWidget):
             self.refresh_today_checkins()
             self.scan_input.clear()
             self.walkin_input.clear()
+            # Emit signal to refresh record user page
+            self.checkin_completed.emit()
             return
 
         self._set_access_style("already", "Attendance already saved today")
@@ -2948,8 +3318,19 @@ class RecordUserPage(QWidget):
         self.db = db
         self.setStyleSheet(f"background: {C['background']};")
         self.current_filter = "ALL"  # ALL, MEMBERSHIP, WALKIN
+        self.period_filter = "Overall"  # Overall, Weekly, Monthly
         self._build()
         self.refresh_records()
+
+    def get_date_filter(self):
+        """Get date filter based on period"""
+        if self.period_filter == "Weekly":
+            from datetime import datetime, timedelta
+            return (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        elif self.period_filter == "Monthly":
+            from datetime import datetime, timedelta
+            return (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        return None
 
     def _build(self):
         lay = QVBoxLayout(self)
@@ -2967,6 +3348,68 @@ class RecordUserPage(QWidget):
         title_row.addWidget(self.count_lbl)
         lay.addLayout(title_row)
 
+        # Period filter row
+        self.period_row_widget = QWidget()
+        period_row = QHBoxLayout(self.period_row_widget)
+        period_row.setContentsMargins(0, 0, 0, 0)
+        period_row.addStretch()
+        self.period_lbl = QLabel("Period: ")
+        self.period_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_BODY))
+        period_row.addWidget(self.period_lbl)
+
+        self.period_combo = QComboBox()
+        self.period_combo.addItems(["Overall", "Weekly", "Monthly"])
+        self.period_combo.setCurrentText(self.period_filter)
+        self.period_combo.setFixedWidth(130)
+        self.period_combo.setFixedHeight(32)
+        self.period_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                padding-right: 4px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+                background: transparent;
+                border-left: 1px solid {C['outline_variant']};
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border: none;
+                width: 12px;
+                height: 8px;
+                background: transparent;
+                margin-right: 4px;
+            }}
+            QComboBox::down-arrow:on {{
+                top: 2px;
+            }}
+            QAbstractItemView {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                selection-background-color: {C['primary_container']};
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                outline: none;
+            }}
+            QAbstractItemView::item:hover {{
+                background-color: {C['surface_container_high']};
+            }}
+            QAbstractItemView::item:selected {{
+                background-color: {C['primary_container']};
+                color: {C['on_primary']};
+            }}
+        """)
+        self.period_combo.currentTextChanged.connect(self.on_period_changed)
+        period_row.addWidget(self.period_combo)
+        lay.addWidget(self.period_row_widget)
+
         # Filter row
         filter_row = QHBoxLayout()
         filter_row.setSpacing(14)
@@ -2982,23 +3425,61 @@ class RecordUserPage(QWidget):
 
         filter_row.addSpacing(20)
 
-        # Filter type buttons
+        # Filter type combo box
         filter_label = QLabel("FILTER:")
         filter_label.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_HEADLINE, 1))
         filter_row.addWidget(filter_label)
 
-        self.filter_buttons = {}
-        for filter_type, label in [("ALL", "All Check-ins"), ("MEMBERSHIP", "Membership"), ("WALKIN", "Walk-in")]:
-            btn = QPushButton(label)
-            btn.setFixedHeight(38)
-            btn.setFixedWidth(140)
-            btn.setCheckable(True)
-            if filter_type == "ALL":
-                btn.setChecked(True)
-            btn.clicked.connect(lambda _, f=filter_type: self._on_filter_changed(f))
-            btn.setStyleSheet(self._get_filter_button_style(filter_type == "ALL"))
-            self.filter_buttons[filter_type] = btn
-            filter_row.addWidget(btn)
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["All Check-ins", "Membership", "Walk-in"])
+        self.filter_combo.setFixedWidth(140)
+        self.filter_combo.setFixedHeight(38)
+        self.filter_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                padding: 6px 8px;
+                padding-right: 4px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+                background: transparent;
+                border-left: 1px solid {C['outline_variant']};
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border: none;
+                width: 12px;
+                height: 8px;
+                background: transparent;
+                margin-right: 4px;
+            }}
+            QComboBox::down-arrow:on {{
+                top: 2px;
+            }}
+            QAbstractItemView {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                selection-background-color: {C['primary_container']};
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                outline: none;
+            }}
+            QAbstractItemView::item:hover {{
+                background-color: {C['surface_container_high']};
+            }}
+            QAbstractItemView::item:selected {{
+                background-color: {C['primary_container']};
+                color: {C['on_primary']};
+            }}
+        """)
+        self.filter_combo.currentTextChanged.connect(self._on_filter_combo_changed)
+        filter_row.addWidget(self.filter_combo)
 
         filter_row.addStretch()
 
@@ -3053,50 +3534,26 @@ class RecordUserPage(QWidget):
         """)
         lay.addWidget(self.table)
 
-    def _get_filter_button_style(self, active=False):
-        if active:
-            return f"""
-                QPushButton {{
-                    background: {C['secondary']};
-                    color: {C['on_secondary']};
-                    font-family: '{FONT_HEADLINE}';
-                    font-size: 10px;
-                    font-weight: 700;
-                    letter-spacing: 2px;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 8px 12px;
-                }}
-                QPushButton:hover {{
-                    background: #9de896;
-                }}
-            """
-        else:
-            return f"""
-                QPushButton {{
-                    background: transparent;
-                    color: {C['on_surface_variant']};
-                    font-family: '{FONT_HEADLINE}';
-                    font-size: 10px;
-                    font-weight: 600;
-                    letter-spacing: 2px;
-                    border: 1px solid {C['outline_variant']}40;
-                    border-radius: 4px;
-                    padding: 8px 12px;
-                }}
-                QPushButton:hover {{
-                    color: {C['primary']};
-                    border-color: {C['primary']}60;
-                }}
-            """
+    def _on_filter_combo_changed(self, text):
+        """Handle filter combo box change - convert display text to filter type"""
+        filter_map = {
+            "All Check-ins": "ALL",
+            "Membership": "MEMBERSHIP",
+            "Walk-in": "WALKIN"
+        }
+        filter_type = filter_map.get(text, "ALL")
+        self._on_filter_changed(filter_type)
 
     def _on_filter_changed(self, filter_type):
-        # Update button styles
-        for f_type, btn in self.filter_buttons.items():
-            is_active = f_type == filter_type
-            btn.setStyleSheet(self._get_filter_button_style(is_active))
-
         self.current_filter = filter_type
+
+        # Show period filter only for ALL and MEMBERSHIP.
+        show_period = filter_type in ("ALL", "MEMBERSHIP")
+        self.period_row_widget.setVisible(show_period)
+        if not show_period and self.period_filter != "Overall":
+            # Walk-in ignores period; force overall to avoid hidden stale filter.
+            self.period_filter = "Overall"
+            self.period_combo.setCurrentText("Overall")
         
         # Update table columns based on filter type
         if filter_type == "MEMBERSHIP":
@@ -3125,46 +3582,95 @@ class RecordUserPage(QWidget):
         
         self.refresh_records()
 
+    def on_period_changed(self, period):
+        """Handle period filter change"""
+        self.period_filter = period
+        self.refresh_records()
+
     def refresh_records(self):
         # Get records from database based on filter
         search_text = self.search_input.text().lower().strip()
         all_records = []
+        date_filter = self.get_date_filter() if self.current_filter in ("ALL", "MEMBERSHIP") else None
 
         with sqlite3.connect(self.db.db_path) as conn:
             if self.current_filter == "MEMBERSHIP":
-                # Show all registered members with their start and expiration dates
-                cur = conn.execute(
-                    """
-                    SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
-                    FROM member_registrations
-                    ORDER BY id DESC
-                    """
-                )
+                # Show registered members; separate Weekly and Monthly plans.
+                if self.period_filter == "Weekly":
+                    cur = conn.execute(
+                        """
+                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                        FROM member_registrations
+                        WHERE protocol_name = 'Weekly'
+                        ORDER BY id DESC
+                        """,
+                    )
+                elif self.period_filter == "Monthly":
+                    cur = conn.execute(
+                        """
+                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                        FROM member_registrations
+                        WHERE protocol_name = 'Monthly'
+                        ORDER BY id DESC
+                        """
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                        FROM member_registrations
+                        ORDER BY id DESC
+                        """
+                    )
                 all_records = cur.fetchall()
                 
             elif self.current_filter == "WALKIN":
                 # Only walk-in check-ins
-                cur = conn.execute(
-                    """
-                    SELECT id, member_name, member_id, checkin_date, checkin_time, 
-                        checkout_time, station, registration_id
-                    FROM daily_checkins
-                    WHERE registration_id IS NULL
-                    ORDER BY checkin_date DESC, checkin_time DESC
-                    """
-                )
+                if date_filter:
+                    cur = conn.execute(
+                        """
+                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                            checkout_time, station, registration_id
+                        FROM daily_checkins
+                        WHERE registration_id IS NULL AND checkin_date >= ?
+                        ORDER BY checkin_date DESC, checkin_time DESC
+                        """,
+                        (date_filter,)
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                            checkout_time, station, registration_id
+                        FROM daily_checkins
+                        WHERE registration_id IS NULL
+                        ORDER BY checkin_date DESC, checkin_time DESC
+                        """
+                    )
                 all_records = cur.fetchall()
                 
             else:  # ALL
                 # All check-ins (both members and walk-ins) + unvisited members
-                cur = conn.execute(
-                    """
-                    SELECT id, member_name, member_id, checkin_date, checkin_time, 
-                        checkout_time, station, registration_id
-                    FROM daily_checkins
-                    ORDER BY checkin_date DESC, checkin_time DESC
-                    """
-                )
+                if date_filter:
+                    cur = conn.execute(
+                        """
+                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                            checkout_time, station, registration_id
+                        FROM daily_checkins
+                        WHERE checkin_date >= ?
+                        ORDER BY checkin_date DESC, checkin_time DESC
+                        """,
+                        (date_filter,)
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                            checkout_time, station, registration_id
+                        FROM daily_checkins
+                        ORDER BY checkin_date DESC, checkin_time DESC
+                        """
+                    )
                 checkin_records = cur.fetchall()
                 
                 # Also get newly registered members without check-ins
@@ -3218,8 +3724,17 @@ class RecordUserPage(QWidget):
                 # ALL and WALKIN filter records: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
                 checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id = rec
                 
+                # Parse date and time - handle cases where they might be concatenated
                 display_date = date if date else "(Not checked in)"
                 display_checkin = checkin_time if checkin_time else "--"
+                
+                # If date contains a space and checkin_time is empty/null, split them
+                if date and " " in date and (not checkin_time or checkin_time == "--"):
+                    parts = date.split(" ")
+                    display_date = parts[0]  # Get date part
+                    if len(parts) > 1:
+                        display_checkin = parts[1]  # Get time part
+                
                 display_checkout = checkout_time or "--"
                 
                 values = [
@@ -3271,9 +3786,9 @@ class MainWindow(QMainWindow):
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(0)
 
-        # Top bar
+        # Top bar - Hidden
         self.top_bar = TopBar("Command Center")
-        main_lay.addWidget(self.top_bar)
+        # main_lay.addWidget(self.top_bar)  # Hidden
 
         # Body: sidebar + content
         body = QHBoxLayout()
@@ -3282,6 +3797,7 @@ class MainWindow(QMainWindow):
 
         self.sidebar = Sidebar()
         self.sidebar.nav_changed.connect(self._on_nav)
+        self.sidebar.logout_requested.connect(self._on_logout)
         body.addWidget(self.sidebar)
 
         # Page stack
@@ -3289,7 +3805,7 @@ class MainWindow(QMainWindow):
         self.page_stack.setStyleSheet(f"background: {C['background']};")
 
         self.pages = [
-            DashboardPage(),
+            DashboardPage(self.db),
             RecordUserPage(self.db),
             RegisterPage(self.db),
             QRCheckInPage(self.db),
@@ -3298,6 +3814,15 @@ class MainWindow(QMainWindow):
         page_titles = ["Command Center", "Record User", "Register Protocol", "Daily Check-In", "Performance Intelligence"]
         for p in self.pages:
             self.page_stack.addWidget(p)
+        
+        # Connect RegisterPage signal to refresh dashboard
+        register_page = self.pages[2]
+        register_page.registration_completed.connect(lambda: self.pages[0].update_stats())
+        
+        # Connect QRCheckInPage signal to refresh record user page and dashboard stats
+        checkin_page = self.pages[3]
+        checkin_page.checkin_completed.connect(lambda: self.pages[1].refresh_records())
+        checkin_page.checkin_completed.connect(lambda: self.pages[0].update_stats())
 
         body.addWidget(self.page_stack)
 
@@ -3308,12 +3833,22 @@ class MainWindow(QMainWindow):
 
     def _on_login(self):
         self.root_stack.setCurrentIndex(1)
+        self.pages[0].update_stats()
 
     def _on_nav(self, idx):
         self.page_stack.setCurrentIndex(idx)
-        self.top_bar.title_lbl.setText(self._page_titles[idx])
+        # self.top_bar.title_lbl.setText(self._page_titles[idx])  # Hidden
+        if idx == 0:
+            self.pages[0].update_stats()
         if idx == 1:
             self.pages[1].refresh_records()
+
+    def _on_logout(self):
+        """Handle logout - return to login page"""
+        self.login_page.username.clear()
+        self.login_page.password.setText("")
+        self.login_page.error_msg.setVisible(False)
+        self.root_stack.setCurrentIndex(0)
 
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
