@@ -3410,6 +3410,69 @@ class RecordUserPage(QWidget):
         period_row.addWidget(self.period_combo)
         lay.addWidget(self.period_row_widget)
 
+        # Date filter row
+        date_filter_row = QHBoxLayout()
+        date_filter_row.addStretch()
+        
+        date_lbl = QLabel("Date:")
+        date_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_BODY))
+        date_filter_row.addWidget(date_lbl)
+        
+        self.date_edit = QDateEdit()
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setFixedWidth(140)
+        self.date_edit.setFixedHeight(32)
+        self.date_edit.setStyleSheet(f"""
+            QDateEdit {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                padding-right: 4px;
+            }}
+            QDateEdit::drop-down {{
+                border: none;
+                width: 24px;
+                background: transparent;
+                border-left: 1px solid {C['outline_variant']};
+            }}
+            QDateEdit::down-arrow {{
+                image: none;
+                border: none;
+                width: 12px;
+                height: 8px;
+                background: transparent;
+                margin-right: 4px;
+            }}
+            QCalendarWidget {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+            }}
+            QCalendarWidget QWidget {{
+                color: {C['on_surface']};
+            }}
+            QCalendarWidget QAbstractItemView:enabled {{
+                color: {C['on_surface']};
+                background: {C['surface_container_low']};
+                alternate-background-color: {C['surface_container_high']};
+                gridline-color: {C['outline_variant']};
+            }}
+            QCalendarWidget QAbstractItemView:enabled:hover {{
+                background-color: {C['surface_container_high']};
+            }}
+            QCalendarWidget QAbstractItemView:enabled:selected {{
+                background-color: {C['primary_container']};
+            }}
+        """)
+        self.date_edit.dateChanged.connect(self.refresh_records)
+        date_filter_row.addWidget(self.date_edit)
+        date_filter_row.addSpacing(20)
+        lay.addLayout(date_filter_row)
+
         # Filter row
         filter_row = QHBoxLayout()
         filter_row.setSpacing(14)
@@ -3591,7 +3654,9 @@ class RecordUserPage(QWidget):
         # Get records from database based on filter
         search_text = self.search_input.text().lower().strip()
         all_records = []
-        date_filter = self.get_date_filter() if self.current_filter in ("ALL", "MEMBERSHIP") else None
+        
+        # Get selected date from the date picker
+        selected_date = self.date_edit.date().toString("yyyy-MM-dd")
 
         with sqlite3.connect(self.db.db_path) as conn:
             if self.current_filter == "MEMBERSHIP":
@@ -3625,68 +3690,32 @@ class RecordUserPage(QWidget):
                 all_records = cur.fetchall()
                 
             elif self.current_filter == "WALKIN":
-                # Only walk-in check-ins
-                if date_filter:
-                    cur = conn.execute(
-                        """
-                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
-                            checkout_time, station, registration_id
-                        FROM daily_checkins
-                        WHERE registration_id IS NULL AND checkin_date >= ?
-                        ORDER BY checkin_date DESC, checkin_time DESC
-                        """,
-                        (date_filter,)
-                    )
-                else:
-                    cur = conn.execute(
-                        """
-                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
-                            checkout_time, station, registration_id
-                        FROM daily_checkins
-                        WHERE registration_id IS NULL
-                        ORDER BY checkin_date DESC, checkin_time DESC
-                        """
-                    )
+                # Only walk-in check-ins for the selected date
+                cur = conn.execute(
+                    """
+                    SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                        checkout_time, station, registration_id
+                    FROM daily_checkins
+                    WHERE registration_id IS NULL AND checkin_date = ?
+                    ORDER BY checkin_time DESC
+                    """,
+                    (selected_date,)
+                )
                 all_records = cur.fetchall()
                 
             else:  # ALL
-                # All check-ins (both members and walk-ins) + unvisited members
-                if date_filter:
-                    cur = conn.execute(
-                        """
-                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
-                            checkout_time, station, registration_id
-                        FROM daily_checkins
-                        WHERE checkin_date >= ?
-                        ORDER BY checkin_date DESC, checkin_time DESC
-                        """,
-                        (date_filter,)
-                    )
-                else:
-                    cur = conn.execute(
-                        """
-                        SELECT id, member_name, member_id, checkin_date, checkin_time, 
-                            checkout_time, station, registration_id
-                        FROM daily_checkins
-                        ORDER BY checkin_date DESC, checkin_time DESC
-                        """
-                    )
-                checkin_records = cur.fetchall()
-                
-                # Also get newly registered members without check-ins
+                # All check-ins (both members and walk-ins) for the selected date
                 cur = conn.execute(
                     """
-                    SELECT id, full_name, member_id, created_at, NULL, NULL, 'STATION 04', id
-                    FROM member_registrations
-                    WHERE id NOT IN (
-                        SELECT DISTINCT registration_id FROM daily_checkins 
-                        WHERE registration_id IS NOT NULL
-                    )
-                    ORDER BY created_at DESC
-                    """
+                    SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                        checkout_time, station, registration_id
+                    FROM daily_checkins
+                    WHERE checkin_date = ?
+                    ORDER BY checkin_time DESC
+                    """,
+                    (selected_date,)
                 )
-                member_records = cur.fetchall()
-                all_records = checkin_records + member_records
+                all_records = cur.fetchall()
 
         # Filter based on search
         filtered_records = []
