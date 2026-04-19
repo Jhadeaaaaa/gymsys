@@ -8,7 +8,8 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QStackedWidget, QFrame,
     QScrollArea, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
-    QComboBox, QDateEdit, QAbstractItemView, QMessageBox, QFileDialog
+    QComboBox, QDateEdit, QAbstractItemView, QMessageBox, QFileDialog,
+    QSpacerItem
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QDateTime, QDate, QPropertyAnimation,
@@ -87,6 +88,7 @@ class RegistrationDatabase:
                     phone TEXT NOT NULL,
                     member_id TEXT,
                     cycle_start_date TEXT NOT NULL,
+                    cycle_expiration_date TEXT,
                     protocol_name TEXT NOT NULL,
                     protocol_price_php REAL NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -103,6 +105,7 @@ class RegistrationDatabase:
                     member_id TEXT NOT NULL,
                     checkin_date TEXT NOT NULL,
                     checkin_time TEXT NOT NULL,
+                    checkout_time TEXT,
                     station TEXT NOT NULL DEFAULT 'STATION 04',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(member_id, checkin_date)
@@ -110,9 +113,15 @@ class RegistrationDatabase:
                 """
             )
 
-            cols = [row[1] for row in conn.execute("PRAGMA table_info(member_registrations)").fetchall()]
-            if "member_id" not in cols:
-                conn.execute("ALTER TABLE member_registrations ADD COLUMN member_id TEXT")
+            # Add checkout_time column if it doesn't exist
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(daily_checkins)").fetchall()]
+            if "checkout_time" not in cols:
+                conn.execute("ALTER TABLE daily_checkins ADD COLUMN checkout_time TEXT")
+            
+            # Add cycle_expiration_date column if it doesn't exist
+            member_cols = [row[1] for row in conn.execute("PRAGMA table_info(member_registrations)").fetchall()]
+            if "cycle_expiration_date" not in member_cols:
+                conn.execute("ALTER TABLE member_registrations ADD COLUMN cycle_expiration_date TEXT")
 
             missing_member_ids = conn.execute(
                 """
@@ -130,14 +139,29 @@ class RegistrationDatabase:
             conn.commit()
 
     def save_registration(self, payload):
+        from datetime import datetime, timedelta
+        
         member_id = payload.get("member_id") or self._build_member_id(payload["full_name"], payload["phone"])
+        
+        # Calculate expiration date based on protocol
+        start_date = datetime.strptime(payload["cycle_start_date"], "%m/%d/%Y")
+        protocol = payload["protocol_name"]
+        
+        if protocol == "Weekly":
+            expiration_date = (start_date + timedelta(days=7)).strftime("%m/%d/%Y")
+        elif protocol == "Monthly":
+            # Add 30 days for monthly
+            expiration_date = (start_date + timedelta(days=30)).strftime("%m/%d/%Y")
+        else:
+            expiration_date = payload["cycle_start_date"]  # Default to start date
+        
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO member_registrations (
                     full_name, email, phone, member_id, cycle_start_date,
-                    protocol_name, protocol_price_php
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    cycle_expiration_date, protocol_name, protocol_price_php
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["full_name"],
@@ -145,6 +169,7 @@ class RegistrationDatabase:
                     payload["phone"],
                     member_id,
                     payload["cycle_start_date"],
+                    expiration_date,
                     payload["protocol_name"],
                     payload["protocol_price_php"],
                 ),
@@ -156,7 +181,7 @@ class RegistrationDatabase:
             cur = conn.execute(
                 """
                 SELECT id, full_name, email, phone, member_id, cycle_start_date,
-                       protocol_name, protocol_price_php, created_at
+                    protocol_name, protocol_price_php, created_at
                 FROM member_registrations
                 ORDER BY id DESC
                 """
@@ -173,11 +198,11 @@ class RegistrationDatabase:
             cur = conn.execute(
                 """
                 SELECT id, full_name, email, phone, member_id, cycle_start_date,
-                       protocol_name, protocol_price_php
+                    protocol_name, protocol_price_php
                 FROM member_registrations
                 WHERE UPPER(member_id) = UPPER(?)
-                   OR phone = ?
-                   OR full_name LIKE ?
+                OR phone = ?
+                OR full_name LIKE ?
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -278,6 +303,48 @@ class RegistrationDatabase:
             )
             return cur.fetchall()
 
+    def get_checkins_by_date(self, date_str):
+        """Get all check-ins for a specific date"""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT id, member_name, member_id, checkin_time, station, registration_id
+                FROM daily_checkins
+                WHERE checkin_date = ?
+                ORDER BY checkin_time DESC
+                """,
+                (date_str,),
+            )
+            return cur.fetchall()
+
+    def get_membership_checkins_by_date(self, date_str):
+        """Get check-ins with membership cards (registered members only) for a specific date"""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT id, member_name, member_id, checkin_time, station, registration_id
+                FROM daily_checkins
+                WHERE checkin_date = ? AND registration_id IS NOT NULL
+                ORDER BY checkin_time DESC
+                """,
+                (date_str,),
+            )
+            return cur.fetchall()
+
+    def get_walkin_checkins_by_date(self, date_str):
+        """Get walk-in check-ins (no membership card) for a specific date"""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT id, member_name, member_id, checkin_time, station, registration_id
+                FROM daily_checkins
+                WHERE checkin_date = ? AND registration_id IS NULL
+                ORDER BY checkin_time DESC
+                """,
+                (date_str,),
+            )
+            return cur.fetchall()
+
 
 # ─── CUSTOM PAINTER WIDGETS ───────────────────────────────────────────────────
 
@@ -317,7 +384,7 @@ class BarChart(QWidget):
                 p.setPen(QPen(qc("surface_container_lowest")))
                 p.setFont(QFont(FONT_BODY, 6, QFont.Weight.Bold))
                 p.drawText(int(x), int(y) - 2, int(bar_w), 14,
-                           Qt.AlignmentFlag.AlignCenter, f"PEAK:\n{val}")
+                        Qt.AlignmentFlag.AlignCenter, f"PEAK:\n{val}")
                 p.setPen(Qt.PenStyle.NoPen)
             else:
                 p.setBrush(QBrush(qc("surface_container_high")))
@@ -332,7 +399,7 @@ class BarChart(QWidget):
             for i, lbl in enumerate(self.labels):
                 x = pad_l + i * (bar_w + bar_gap)
                 p.drawText(int(x), h - pad_b + 4, int(bar_w), 20,
-                           Qt.AlignmentFlag.AlignCenter, lbl)
+                        Qt.AlignmentFlag.AlignCenter, lbl)
 
 
 class DonutChart(QWidget):
@@ -368,7 +435,7 @@ class DonutChart(QWidget):
         p.setPen(QPen(qc("on_surface_variant")))
         p.setFont(QFont(FONT_BODY, 7))
         p.drawText(QRect(0, cy + r - 6, self.width(), 20),
-                   Qt.AlignmentFlag.AlignCenter, self.label)
+                Qt.AlignmentFlag.AlignCenter, self.label)
 
 
 class WeekHeatmap(QWidget):
@@ -398,7 +465,7 @@ class WeekHeatmap(QWidget):
             p.setPen(QPen(qc("on_surface_variant")))
             p.setFont(QFont(FONT_BODY, 6))
             p.drawText(int(x), 34, int(cell) - 4, 14,
-                       Qt.AlignmentFlag.AlignCenter, labels[i])
+                    Qt.AlignmentFlag.AlignCenter, labels[i])
 
 
 class PowerGauge(QWidget):
@@ -1140,9 +1207,10 @@ class RegisterPage(QWidget):
         self.db = db
         self.form_inputs = {}
         self.protocol_prices = {
-            "Weekly": 45,
-            "Monthly": 120,
+            "Weekly": 120,
+            "Monthly": 350,
         }
+        self.selected_protocol = "Monthly"  # Default selection
         self.member_status = "PENDING ACTIVATION"
         self.setStyleSheet(f"background: {C['background']};")
         self._build()
@@ -1183,7 +1251,7 @@ class RegisterPage(QWidget):
 
         # Section 01: Biometric Data
         s1 = self._make_section("⊙  MEMBER INFORMATION", "01", [
-            ("FIRST NAME LAST NAME", "Juan Cruz", "EMAIL", "name@email.com"),
+            ("FULL NAME", "Juan Cruz", "EMAIL", "name@email.com"),
             ("PHONE NUMBER", "09xx xxx xxxx", "START DATE", "mm/dd/yyyy"),
         ])
         left.addWidget(s1)
@@ -1213,17 +1281,24 @@ class RegisterPage(QWidget):
 
         plan_row = QHBoxLayout()
         plan_row.setSpacing(12)
-        for badge, name, desc, price, active in [
-            ("PLAN W-1", "Weekly", "Pay every week.", php_currency(45), False),
-            ("PLAN M-4", "Monthly", "Pay once per month.", php_currency(120), True),
+        
+        self.plan_cards = {}  # Store references to plan cards
+        
+        for badge, name, desc, price, protocol_key in [
+            ("PLAN W-1", "Weekly", "Pay every week.", php_currency(120), "Weekly"),
+            ("PLAN M-4", "Monthly", "Pay once per month.", php_currency(350), "Monthly"),
         ]:
             pc = QFrame()
-            border_col = C["secondary"] if active else C["outline_variant"] + "40"
+            # Set initial border based on default selection
+            is_selected = (protocol_key == self.selected_protocol)
+            border_col = C["secondary"] if is_selected else C["outline_variant"] + "40"
+            
             pc.setStyleSheet(f"""
                 background: {C['surface_container_low']};
                 border-radius: 6px;
                 border: 2px solid {border_col};
             """)
+            pc.setCursor(Qt.CursorShape.PointingHandCursor)
             pc_lay = QVBoxLayout(pc)
             pc_lay.setContentsMargins(14, 14, 14, 14)
             pc_lay.setSpacing(6)
@@ -1252,40 +1327,14 @@ class RegisterPage(QWidget):
             pc_lay.addWidget(n_lbl)
             pc_lay.addWidget(d_lbl)
             pc_lay.addWidget(pr_lbl)
+            
+            # Store reference and set up click handler
+            self.plan_cards[protocol_key] = pc
+            pc.mousePressEvent = lambda event, proto=protocol_key: self._select_protocol(proto)
+            
             plan_row.addWidget(pc)
 
         s2_lay.addLayout(plan_row)
-
-        protocol_label = QLabel("SELECT PLAN")
-        protocol_label.setStyleSheet(label_style(8, "on_surface_variant", "medium", FONT_HEADLINE, 2))
-        self.protocol_combo = QComboBox()
-        self.protocol_combo.addItem(f"Weekly ({php_currency(45)} / CYCLE)", "Weekly")
-        self.protocol_combo.addItem(f"Monthly ({php_currency(120)} / CYCLE)", "Monthly")
-        self.protocol_combo.setCurrentIndex(1)
-        self.protocol_combo.setFixedHeight(38)
-        self.protocol_combo.setStyleSheet(f"""
-            QComboBox {{
-                background: {C['surface_container_lowest']};
-                color: {C['on_surface']};
-                border: 1px solid {C['outline_variant']}70;
-                border-radius: 4px;
-                padding: 8px 10px;
-                font-family: '{FONT_BODY}';
-                font-size: 12px;
-            }}
-            QComboBox::drop-down {{
-                border: none;
-                width: 24px;
-            }}
-            QComboBox QAbstractItemView {{
-                background: {C['surface_container']};
-                color: {C['on_surface']};
-                border: 1px solid {C['outline_variant']};
-                selection-background-color: {C['surface_container_high']};
-            }}
-        """)
-        s2_lay.addWidget(protocol_label)
-        s2_lay.addWidget(self.protocol_combo)
 
         left.addWidget(s2_card)
         left.addStretch()
@@ -1436,19 +1485,11 @@ class RegisterPage(QWidget):
         token_lay.addWidget(print_btn)
 
         # Security notice
-        sec = QFrame()
-        sec.setStyleSheet(f"background: {C['primary_container']}20; border-radius: 6px; border: 1px solid {C['primary']}30;")
-        sec_lay = QHBoxLayout(sec)
-        sec_lay.setContentsMargins(10, 10, 10, 10)
-        sec_lay.setSpacing(8)
-        sec_icon = QLabel("🔒")
-        sec_icon.setStyleSheet("font-size: 16px;")
-        sec_txt = QLabel("SECURITY NOTICE\nYour data is encrypted and stored securely.")
-        sec_txt.setStyleSheet(label_style(8, "on_surface_variant"))
+        sec_txt = QLabel("Your data is encrypted and stored securely.")
+        sec_txt.setStyleSheet(label_style(9, "on_surface_variant"))
+        sec_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sec_txt.setWordWrap(True)
-        sec_lay.addWidget(sec_icon, 0, Qt.AlignmentFlag.AlignTop)
-        sec_lay.addWidget(sec_txt)
-        token_lay.addWidget(sec)
+        token_lay.addWidget(sec_txt)
 
         right.addWidget(token_card)
         right.addStretch()
@@ -1509,7 +1550,7 @@ class RegisterPage(QWidget):
                     inp.setPlaceholderText(row[i + 1])
                     inp.setFixedHeight(40)
                     inp.setStyleSheet(input_style())
-                    if row[i] == "FIRST NAME LAST NAME":
+                    if row[i] == "FULL NAME":
                         inp.editingFinished.connect(self._normalize_name_field)
                     if row[i] == "PHONE NUMBER":
                         inp.setMaxLength(11)
@@ -1532,12 +1573,32 @@ class RegisterPage(QWidget):
         return " ".join(t[:1].upper() + t[1:].lower() for t in tokens)
 
     def _normalize_name_field(self):
-        name_widget = self.form_inputs.get("FIRST NAME LAST NAME")
+        name_widget = self.form_inputs.get("FULL NAME")
         if not name_widget:
             return
         normalized = self._to_name_case(name_widget.text())
         if normalized != name_widget.text():
             name_widget.setText(normalized)
+    
+    def _select_protocol(self, protocol):
+        self.selected_protocol = protocol
+        # Update plan card styles
+        for proto, card in self.plan_cards.items():
+            if proto == protocol:
+                # Selected card - highlight
+                card.setStyleSheet(f"""
+                    background: {C['surface_container_low']};
+                    border-radius: 6px;
+                    border: 2px solid {C['secondary']};
+                """)
+            else:
+                # Unselected card - muted
+                card.setStyleSheet(f"""
+                    background: {C['surface_container_low']};
+                    border-radius: 6px;
+                    border: 2px solid {C['outline_variant']}40;
+                """)
+        self._update_live_preview()
 
     def _wire_live_preview(self):
         for widget in self.form_inputs.values():
@@ -1545,7 +1606,6 @@ class RegisterPage(QWidget):
                 widget.dateChanged.connect(self._update_live_preview)
             else:
                 widget.textChanged.connect(self._update_live_preview)
-        self.protocol_combo.currentIndexChanged.connect(self._update_live_preview)
 
     def _build_member_id(self, name, phone):
         initials = "".join(part[0] for part in name.upper().split() if part)[:3]
@@ -1555,12 +1615,12 @@ class RegisterPage(QWidget):
         return f"Q8-{initials}-{phone_tail}"
 
     def _update_live_preview(self, *_args):
-        name = self._to_name_case(self.form_inputs["FIRST NAME LAST NAME"].text())
+        name = self._to_name_case(self.form_inputs["FULL NAME"].text())
         email = self.form_inputs["EMAIL"].text().strip()
         phone = self.form_inputs["PHONE NUMBER"].text().strip()
         start_qdate = self.form_inputs["START DATE"].date()
         start_date = start_qdate.toString("MM/dd/yyyy")
-        selected_plan = self.protocol_combo.currentData()
+        selected_plan = self.selected_protocol
         selected_price = float(self.protocol_prices.get(selected_plan, 0))
         card_member_id = self._build_member_id(name, phone)
         if selected_plan == "Weekly":
@@ -1585,26 +1645,26 @@ class RegisterPage(QWidget):
         self.member_id_value_lbl.setText(card_member_id)
 
     def _submit_registration(self):
-        full_name = self._to_name_case(self.form_inputs["FIRST NAME LAST NAME"].text())
+        full_name = self._to_name_case(self.form_inputs["FULL NAME"].text())
         email = self.form_inputs["EMAIL"].text().strip()
         phone = self.form_inputs["PHONE NUMBER"].text().strip()
         cycle_start_date = self.form_inputs["START DATE"].date().toString("MM/dd/yyyy")
 
-        self.form_inputs["FIRST NAME LAST NAME"].setText(full_name)
+        self.form_inputs["FULL NAME"].setText(full_name)
 
         if not all([full_name, email, phone, cycle_start_date]):
             QMessageBox.warning(self, "Missing Data", "Please complete all required fields before saving.")
             return
 
-        if len(full_name.split()) != 2:
-            QMessageBox.warning(self, "Invalid Name", "Please enter first name and last name only.")
+        if not full_name or len(full_name.strip()) == 0:
+            QMessageBox.warning(self, "Invalid Name", "Please enter a full name.")
             return
 
         if (not phone.isdigit()) or len(phone) != 11:
             QMessageBox.warning(self, "Invalid Phone Number", "Phone number must be exactly 11 digits.")
             return
 
-        protocol_name = self.protocol_combo.currentData()
+        protocol_name = self.selected_protocol
         protocol_price = float(self.protocol_prices.get(protocol_name, 0))
         member_id = self._build_member_id(full_name, phone)
 
@@ -1633,10 +1693,10 @@ class RegisterPage(QWidget):
                 field.setDate(QDate.currentDate())
             else:
                 field.clear()
-        self.protocol_combo.setCurrentIndex(1)
+        self.selected_protocol = "Monthly"
         self.member_status = "PENDING ACTIVATION"
         self.status_value_lbl.setText(self.member_status)
-        self._update_live_preview()
+        self._select_protocol("Monthly")
 
     def _export_member_card_pdf(self):
         default_file = f"member_card_{self.member_id_value_lbl.text().replace(' ', '_').replace(':', '')}.pdf"
@@ -2880,13 +2940,14 @@ class ReportsPage(QWidget):
         lay.addStretch()
 
 
-# ─── RECORD USER PAGE (Placeholder for nav item) ──────────────────────────────
+# ─── RECORD USER PAGE: CHECK-IN RECORDS ──────────────────────────────────────
 
 class RecordUserPage(QWidget):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.setStyleSheet(f"background: {C['background']};")
+        self.current_filter = "ALL"  # ALL, MEMBERSHIP, WALKIN
         self._build()
         self.refresh_records()
 
@@ -2895,36 +2956,73 @@ class RecordUserPage(QWidget):
         lay.setContentsMargins(24, 24, 24, 24)
         lay.setSpacing(14)
 
+        # Title row
         title_row = QHBoxLayout()
-        title = QLabel("REGISTERED MEMBERS")
+        title = QLabel("◈  CHECK-IN RECORDS")
         title.setStyleSheet(label_style(24, "on_surface", "bold", FONT_HEADLINE, 1))
         self.count_lbl = QLabel("0 records")
         self.count_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_HEADLINE, 1))
-        refresh_btn = QPushButton("REFRESH")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setStyleSheet(btn_secondary_style())
-        refresh_btn.clicked.connect(self.refresh_records)
         title_row.addWidget(title)
         title_row.addStretch()
         title_row.addWidget(self.count_lbl)
-        title_row.addSpacing(8)
-        title_row.addWidget(refresh_btn)
         lay.addLayout(title_row)
 
+        # Filter row
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(14)
+
+        # Search box
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search by name or ID...")
+        self.search_input.setFixedHeight(38)
+        self.search_input.setFixedWidth(300)
+        self.search_input.setStyleSheet(input_style())
+        self.search_input.textChanged.connect(self.refresh_records)
+        filter_row.addWidget(self.search_input)
+
+        filter_row.addSpacing(20)
+
+        # Filter type buttons
+        filter_label = QLabel("FILTER:")
+        filter_label.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_HEADLINE, 1))
+        filter_row.addWidget(filter_label)
+
+        self.filter_buttons = {}
+        for filter_type, label in [("ALL", "All Check-ins"), ("MEMBERSHIP", "Membership"), ("WALKIN", "Walk-in")]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(38)
+            btn.setFixedWidth(140)
+            btn.setCheckable(True)
+            if filter_type == "ALL":
+                btn.setChecked(True)
+            btn.clicked.connect(lambda _, f=filter_type: self._on_filter_changed(f))
+            btn.setStyleSheet(self._get_filter_button_style(filter_type == "ALL"))
+            self.filter_buttons[filter_type] = btn
+            filter_row.addWidget(btn)
+
+        filter_row.addStretch()
+
+        # Refresh button
+        refresh_btn = QPushButton("REFRESH")
+        refresh_btn.setFixedHeight(38)
+        refresh_btn.setStyleSheet(btn_secondary_style())
+        refresh_btn.clicked.connect(self.refresh_records)
+        filter_row.addWidget(refresh_btn)
+
+        lay.addLayout(filter_row)
+
+        # Records table
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "ID", "Name", "Email", "Phone", "Card ID", "Start Date", "Plan", "Fee", "Created",
+            "Name", "Member ID", "Date", "Check-in Time", "Check-out Time", "Station",
         ])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -2955,26 +3053,187 @@ class RecordUserPage(QWidget):
         """)
         lay.addWidget(self.table)
 
-    def refresh_records(self):
-        rows = self.db.get_registrations()
-        self.table.setRowCount(len(rows))
-        self.count_lbl.setText(f"{len(rows)} records")
+    def _get_filter_button_style(self, active=False):
+        if active:
+            return f"""
+                QPushButton {{
+                    background: {C['secondary']};
+                    color: {C['on_secondary']};
+                    font-family: '{FONT_HEADLINE}';
+                    font-size: 10px;
+                    font-weight: 700;
+                    letter-spacing: 2px;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 12px;
+                }}
+                QPushButton:hover {{
+                    background: #9de896;
+                }}
+            """
+        else:
+            return f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {C['on_surface_variant']};
+                    font-family: '{FONT_HEADLINE}';
+                    font-size: 10px;
+                    font-weight: 600;
+                    letter-spacing: 2px;
+                    border: 1px solid {C['outline_variant']}40;
+                    border-radius: 4px;
+                    padding: 8px 12px;
+                }}
+                QPushButton:hover {{
+                    color: {C['primary']};
+                    border-color: {C['primary']}60;
+                }}
+            """
 
-        for r, rec in enumerate(rows):
-            rid, name, email, phone, member_id, start_date, plan, fee, created = rec
-            values = [
-                str(rid),
-                name,
-                email,
-                phone,
-                member_id or "--",
-                start_date,
-                plan,
-                php_currency(fee),
-                created,
-            ]
+    def _on_filter_changed(self, filter_type):
+        # Update button styles
+        for f_type, btn in self.filter_buttons.items():
+            is_active = f_type == filter_type
+            btn.setStyleSheet(self._get_filter_button_style(is_active))
+
+        self.current_filter = filter_type
+        
+        # Update table columns based on filter type
+        if filter_type == "MEMBERSHIP":
+            # Membership: show Name, Member ID, Start Date, Expiration Date, Station
+            self.table.setColumnCount(5)
+            self.table.setHorizontalHeaderLabels([
+                "Name", "Member ID", "Start Date", "Expiration Date", "Station",
+            ])
+            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        else:
+            # ALL and WALKIN: show Name, Member ID, Date, Check-in Time, Check-out Time, Station
+            self.table.setColumnCount(6)
+            self.table.setHorizontalHeaderLabels([
+                "Name", "Member ID", "Date", "Check-in Time", "Check-out Time", "Station",
+            ])
+            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        
+        self.refresh_records()
+
+    def refresh_records(self):
+        # Get records from database based on filter
+        search_text = self.search_input.text().lower().strip()
+        all_records = []
+
+        with sqlite3.connect(self.db.db_path) as conn:
+            if self.current_filter == "MEMBERSHIP":
+                # Show all registered members with their start and expiration dates
+                cur = conn.execute(
+                    """
+                    SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                    FROM member_registrations
+                    ORDER BY id DESC
+                    """
+                )
+                all_records = cur.fetchall()
+                
+            elif self.current_filter == "WALKIN":
+                # Only walk-in check-ins
+                cur = conn.execute(
+                    """
+                    SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                        checkout_time, station, registration_id
+                    FROM daily_checkins
+                    WHERE registration_id IS NULL
+                    ORDER BY checkin_date DESC, checkin_time DESC
+                    """
+                )
+                all_records = cur.fetchall()
+                
+            else:  # ALL
+                # All check-ins (both members and walk-ins) + unvisited members
+                cur = conn.execute(
+                    """
+                    SELECT id, member_name, member_id, checkin_date, checkin_time, 
+                        checkout_time, station, registration_id
+                    FROM daily_checkins
+                    ORDER BY checkin_date DESC, checkin_time DESC
+                    """
+                )
+                checkin_records = cur.fetchall()
+                
+                # Also get newly registered members without check-ins
+                cur = conn.execute(
+                    """
+                    SELECT id, full_name, member_id, created_at, NULL, NULL, 'STATION 04', id
+                    FROM member_registrations
+                    WHERE id NOT IN (
+                        SELECT DISTINCT registration_id FROM daily_checkins 
+                        WHERE registration_id IS NOT NULL
+                    )
+                    ORDER BY created_at DESC
+                    """
+                )
+                member_records = cur.fetchall()
+                all_records = checkin_records + member_records
+
+        # Filter based on search
+        filtered_records = []
+        for rec in all_records:
+            # Unpack based on filter type
+            if self.current_filter == "MEMBERSHIP":
+                # MEMBERSHIP: id, name, member_id, start_date, expiration_date, station, reg_id
+                rec_id, name, member_id, start_date, expiration_date, station, reg_id = rec
+            else:
+                # ALL and WALKIN: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
+                checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id = rec
+            
+            if search_text and search_text not in (name.lower() + member_id.lower()):
+                continue
+            
+            filtered_records.append(rec)
+
+        self.table.setRowCount(len(filtered_records))
+        self.count_lbl.setText(f"{len(filtered_records)} records")
+
+        for r, rec in enumerate(filtered_records):
+            # Display based on filter type - records have different structures
+            if self.current_filter == "MEMBERSHIP":
+                # MEMBERSHIP filter records: id, name, member_id, start_date, expiration_date, station, reg_id
+                rec_id, name, member_id, start_date, expiration_date, station, reg_id = rec
+                
+                values = [
+                    name,
+                    member_id or "--",
+                    start_date or "--",
+                    expiration_date or "--",
+                    station,
+                ]
+            else:
+                # ALL and WALKIN filter records: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
+                checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id = rec
+                
+                display_date = date if date else "(Not checked in)"
+                display_checkin = checkin_time if checkin_time else "--"
+                display_checkout = checkout_time or "--"
+                
+                values = [
+                    name,
+                    member_id or "--",
+                    display_date,
+                    display_checkin,
+                    display_checkout,
+                    station,
+                ]
+            
             for c, value in enumerate(values):
-                self.table.setItem(r, c, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                self.table.setItem(r, c, item)
 
 
 # ─── MAIN APP WINDOW ──────────────────────────────────────────────────────────
