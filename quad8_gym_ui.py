@@ -380,6 +380,45 @@ class RegistrationDatabase:
             )
             return cur.fetchall()
 
+    def get_total_checkins(self):
+        """Get total check-ins across all dates."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM daily_checkins")
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+    def get_checkin_totals_per_date(self, days=5):
+        """Get Weekly+Monthly membership avails per date for the last N calendar dates."""
+        today = QDate.currentDate()
+        start_date = today.addDays(-(days - 1))
+        start_str = start_date.toString("yyyy-MM-dd")
+        end_str = today.toString("yyyy-MM-dd")
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT DATE(created_at) AS avail_date, COUNT(*)
+                FROM member_registrations
+                WHERE protocol_name IN ('Weekly', 'Monthly')
+                AND DATE(created_at) BETWEEN ? AND ?
+                GROUP BY DATE(created_at)
+                """,
+                (start_str, end_str),
+            )
+            rows = cur.fetchall()
+
+        count_map = {date_str: count for date_str, count in rows}
+        labels = []
+        values = []
+        for i in range(days):
+            date = start_date.addDays(i)
+            date_str = date.toString("yyyy-MM-dd")
+            labels.append(date.toString("MM/dd"))
+            values.append(count_map.get(date_str, 0))
+
+        # Highlight the most recent date (today) in the five-bar window.
+        return values, labels, days - 1
+
     def get_checkins_by_date(self, date_str):
         """Get all check-ins for a specific date"""
         with sqlite3.connect(self.db_path) as conn:
@@ -422,6 +461,113 @@ class RegistrationDatabase:
             )
             return cur.fetchall()
 
+    def get_member_week_checkins(self, member_id):
+        """Get check-in counts for each day of the current week for a specific member"""
+        from datetime import datetime, timedelta
+        
+        today = QDate.currentDate()
+        # Get Monday of current week
+        monday = today.addDays(-(today.dayOfWeek() - 1))
+        
+        counts = []
+        for i in range(7):  # Mon-Sun
+            date = monday.addDays(i)
+            date_str = date.toString("yyyy-MM-dd")
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """SELECT COUNT(*) FROM daily_checkins WHERE member_id = ? AND checkin_date = ?""",
+                    (member_id, date_str),
+                )
+                count = cur.fetchone()[0]
+                counts.append(count if count > 0 else 0)
+        
+        return counts
+
+    def get_daily_checkins_past_days(self, days=7):
+        """Get check-in counts for days centered on today (3 before, today, 3 after for days=7)"""
+        today = QDate.currentDate()
+        daily_counts = []
+        daily_dates = []
+        
+        # Calculate how many days before and after today
+        before_days = days // 2
+        after_days = days - before_days - 1
+        
+        # Go backwards from before_days ago to after_days in the future
+        for i in range(-before_days, after_days + 1):
+            date = today.addDays(i)
+            date_str = date.toString("yyyy-MM-dd")
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """SELECT COUNT(*) FROM daily_checkins WHERE checkin_date = ?""",
+                    (date_str,),
+                )
+                count = cur.fetchone()[0]
+                daily_counts.append(count)
+                daily_dates.append(date)
+        
+        # today_index is the middle index
+        today_index = before_days
+        return daily_counts, daily_dates, today_index
+
+    def get_daily_checkins_around_date(self, center_date, days=7):
+        """Get check-in counts for days centered on a specific date"""
+        daily_counts = []
+        daily_dates = []
+        
+        # Calculate how many days before and after center date
+        before_days = days // 2
+        after_days = days - before_days - 1
+        
+        # Go backwards from before_days ago to after_days in the future
+        for i in range(-before_days, after_days + 1):
+            date = center_date.addDays(i)
+            date_str = date.toString("yyyy-MM-dd")
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """SELECT COUNT(*) FROM daily_checkins WHERE checkin_date = ?""",
+                    (date_str,),
+                )
+                count = cur.fetchone()[0]
+                daily_counts.append(count)
+                daily_dates.append(date)
+        
+        # center_index is the middle index
+        center_index = before_days
+        return daily_counts, daily_dates, center_index
+
+    def get_daily_memberships_around_date(self, center_date, days=7):
+        """Get membership registration counts for days centered on a specific date"""
+        daily_counts = []
+        daily_dates = []
+        
+        # Calculate how many days before and after center date
+        before_days = days // 2
+        after_days = days - before_days - 1
+        
+        # Go backwards from before_days ago to after_days in the future
+        for i in range(-before_days, after_days + 1):
+            date = center_date.addDays(i)
+            date_str = date.toString("yyyy-MM-dd")
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM member_registrations 
+                    WHERE DATE(created_at) = ?
+                    """,
+                    (date_str,),
+                )
+                count = cur.fetchone()[0]
+                daily_counts.append(count)
+                daily_dates.append(date)
+        
+        # center_index is the middle index
+        center_index = before_days
+        return daily_counts, daily_dates, center_index
+
 
 # ─── CUSTOM PAINTER WIDGETS ───────────────────────────────────────────────────
 
@@ -445,27 +591,36 @@ class BarChart(QWidget):
             return
         max_val = max(self.data) or 1
         bar_gap = 6
-        bar_w = max(4, (chart_w - bar_gap * (n - 1)) / n)
+        if n == 1:
+            bar_w = max(32, min(120, chart_w * 0.35))
+        else:
+            bar_w = max(4, (chart_w - bar_gap * (n - 1)) / n)
 
         for i, val in enumerate(self.data):
-            bh = int(chart_h * val / max_val)
-            x = pad_l + i * (bar_w + bar_gap)
-            y = pad_t + chart_h - bh
-            if i == self.highlight_index:
-                grad = QLinearGradient(x, y, x, y + bh)
-                grad.setColorAt(0, qc("secondary"))
-                grad.setColorAt(1, qc("secondary_container"))
-                p.setBrush(QBrush(grad))
-                p.setPen(Qt.PenStyle.NoPen)
-                # Highlight label
-                p.setPen(QPen(qc("surface_container_lowest")))
-                p.setFont(QFont(FONT_BODY, 6, QFont.Weight.Bold))
-                p.drawText(int(x), int(y) - 2, int(bar_w), 14,
-                        Qt.AlignmentFlag.AlignCenter, f"PEAK:\n{val}")
-                p.setPen(Qt.PenStyle.NoPen)
+            raw_h = int(chart_h * val / max_val)
+            # Keep small values visible; if highlighted day is zero, show a minimal stub bar.
+            if val > 0:
+                bh = max(6, raw_h)
+            elif i == self.highlight_index:
+                bh = 3
             else:
-                p.setBrush(QBrush(qc("surface_container_high")))
+                bh = 0
+            if n == 1:
+                x = pad_l + (chart_w - bar_w) / 2
+            else:
+                x = pad_l + i * (bar_w + bar_gap)
+            y = pad_t + chart_h - bh
+            # All bars are green gradient
+            grad = QLinearGradient(x, y, x, y + bh)
+            grad.setColorAt(0, qc("secondary"))
+            grad.setColorAt(1, qc("secondary_container"))
+            p.setBrush(QBrush(grad))
+            
+            if i == self.highlight_index:
+                p.setPen(QPen(qc("secondary"), 1))
+            else:
                 p.setPen(Qt.PenStyle.NoPen)
+            
             r = 3
             p.drawRoundedRect(int(x), int(y), int(bar_w), bh, r, r)
 
@@ -527,11 +682,19 @@ class WeekHeatmap(QWidget):
         n = 7
         w = self.width()
         cell = (w - 8) / n
-        labels = ["MON", "TUE", "WED", "THU", "FRI", "TODAY", "SUN"]
+        
+        # Get current day of week (1=Monday, 7=Sunday), convert to 0-6 index
+        today_index = QDate.currentDate().dayOfWeek() - 1
+        
+        day_labels = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+        labels = day_labels.copy()
+        # Replace the label for today with "TODAY"
+        labels[today_index] = "TODAY"
+        
         for i, val in enumerate(self.values):
             x = 4 + i * cell
             intensity = val / 5.0
-            if i == 5:  # TODAY
+            if i == today_index:  # Highlight today based on actual day
                 col = QColor(C["secondary"])
             else:
                 col = QColor(C["secondary_container"])
@@ -1639,6 +1802,20 @@ class DashboardPage(QWidget):
             print(f"Error in get_today_checkins: {e}")
             return 0
 
+    def update_velocity_chart(self):
+        """Update the check-in velocity chart for overall traffic per check-in date."""
+        if not hasattr(self, "velocity_chart") or not self.db:
+            return
+        
+        try:
+            values, labels, latest_index = self.db.get_checkin_totals_per_date()
+            self.velocity_chart.data = values
+            self.velocity_chart.labels = labels
+            self.velocity_chart.highlight_index = latest_index
+            self.velocity_chart.update()
+        except Exception as e:
+            print(f"Error in update_velocity_chart: {e}")
+
     def update_stats(self, period="Overall"):
         """Update stat cards based on selected period"""
         # Always fetch fresh data from database
@@ -1697,6 +1874,7 @@ class DashboardPage(QWidget):
         self.update_plan_purchase_panel()
         self.update_revenue_panel()
         self.update_recent_activity_panel()
+        self.update_velocity_chart()
 
     def _build(self):
         scroll = QScrollArea(self)
@@ -1791,7 +1969,7 @@ class DashboardPage(QWidget):
 
         ct = QLabel("Check-in Velocity")
         ct.setStyleSheet(label_style(15, "on_surface", "bold", FONT_HEADLINE))
-        cs = QLabel("Hourly member traffic analysis")
+        cs = QLabel("Overall member traffic per check-in date")
         cs.setStyleSheet(label_style(10, "on_surface_variant"))
 
         # Live badge
@@ -1813,10 +1991,10 @@ class DashboardPage(QWidget):
         chart_lay.addLayout(badge_row)
         chart_lay.addWidget(cs)
 
-        bar_data = [22, 35, 48, 42, 58, 44, 38, 30, 25]
-        labels = ["06:00", "09:00", "12:00", "15:00", "18:00", "21:00", "00:00", "", ""]
-        bar_chart = BarChart(bar_data, labels[:len(bar_data)], highlight_index=4)
+        values, labels, latest_index = self.db.get_checkin_totals_per_date()
+        bar_chart = BarChart(values, labels, highlight_index=latest_index)
         bar_chart.setMinimumHeight(160)
+        self.velocity_chart = bar_chart
         chart_lay.addWidget(bar_chart)
         mid_row.addWidget(chart_card, 3)
 
@@ -3023,6 +3201,11 @@ class QRCheckInPage(QWidget):
         self.member_plan_lbl.setText(f"PLAN: {member['protocol_name']}")
         self.member_start_lbl.setText(f"START DATE: {member['cycle_start_date']}")
         self.member_phone_lbl.setText(f"PHONE: {member['phone']}")
+        
+        # Update heatmap with actual weekly check-in data
+        week_data = self.db.get_member_week_checkins(member['member_id'])
+        self.heatmap.values = week_data
+        self.heatmap.update()
 
     def _populate_walkin_card(self, walkin_name, walkin_member_id, checkin_date=None, checkin_time=None, checkout_time=None):
         initials = "".join(part[0] for part in walkin_name.split() if part)[:2].upper() or "WI"
@@ -3506,8 +3689,8 @@ class QRCheckInPage(QWidget):
         ps_row.addWidget(ps_v)
         member_lay.addLayout(ps_row)
 
-        heatmap = WeekHeatmap([2, 4, 3, 4, 3, 5, 4])
-        member_lay.addWidget(heatmap)
+        self.heatmap = WeekHeatmap([0, 0, 0, 0, 0, 0, 0])
+        member_lay.addWidget(self.heatmap)
 
         # Plan info
         plan_card = QFrame()
