@@ -1172,38 +1172,319 @@ class DashboardPage(QWidget):
             return 0
 
     def get_weekly_checkins(self):
-        """Get total members enrolled in Weekly membership plan."""
+        """Get total ACTIVE members enrolled in Weekly membership plan."""
         if not self.db:
             return 0
         try:
             import sqlite3
+            active_weekly = 0
+            today = QDate.currentDate()
             with sqlite3.connect(self.db.db_path) as conn:
                 cur = conn.execute(
-                    "SELECT COUNT(*) FROM member_registrations WHERE protocol_name = ?",
+                    """
+                    SELECT cycle_expiration_date
+                    FROM member_registrations
+                    WHERE protocol_name = ?
+                    """,
                     ("Weekly",)
                 )
-                result = cur.fetchone()
-                return result[0] if result else 0
+                for (expiration_date,) in cur.fetchall():
+                    if self._is_active_membership(expiration_date):
+                        active_weekly += 1
+                return active_weekly
         except Exception as e:
             print(f"Error in get_weekly_checkins: {e}")
             return 0
 
     def get_monthly_checkins(self):
-        """Get total members enrolled in Monthly membership plan."""
+        """Get total ACTIVE members enrolled in Monthly membership plan."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            active_monthly = 0
+            today = QDate.currentDate()
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT cycle_expiration_date
+                    FROM member_registrations
+                    WHERE protocol_name = ?
+                    """,
+                    ("Monthly",)
+                )
+                for (expiration_date,) in cur.fetchall():
+                    if self._is_active_membership(expiration_date):
+                        active_monthly += 1
+                return active_monthly
+        except Exception as e:
+            print(f"Error in get_monthly_checkins: {e}")
+            return 0
+
+    def _is_active_membership(self, expiration_date):
+        """Use the same ACTIVE rule as Record User membership status."""
+        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        return expiry.isValid() and QDate.currentDate() <= expiry
+
+    def get_active_memberships(self):
+        """Get total active memberships based on expiration date."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            active_members = 0
+            today = QDate.currentDate()
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT cycle_expiration_date
+                    FROM member_registrations
+                    """
+                )
+                for (expiration_date,) in cur.fetchall():
+                    if self._is_active_membership(expiration_date):
+                        active_members += 1
+            return active_members
+        except Exception as e:
+            print(f"Error in get_active_memberships: {e}")
+            return 0
+
+    def get_overall_revenue(self):
+        """Get total recorded revenue from all memberships."""
         if not self.db:
             return 0
         try:
             import sqlite3
             with sqlite3.connect(self.db.db_path) as conn:
                 cur = conn.execute(
-                    "SELECT COUNT(*) FROM member_registrations WHERE protocol_name = ?",
-                    ("Monthly",)
+                    """
+                    SELECT COALESCE(SUM(protocol_price_php), 0)
+                    FROM member_registrations
+                    """
                 )
                 result = cur.fetchone()
-                return result[0] if result else 0
+                return float(result[0]) if result and result[0] is not None else 0
         except Exception as e:
-            print(f"Error in get_monthly_checkins: {e}")
+            print(f"Error in get_overall_revenue: {e}")
             return 0
+
+    def get_plan_revenue(self, protocol_name):
+        """Get total recorded revenue for a specific membership plan."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(protocol_price_php), 0)
+                    FROM member_registrations
+                    WHERE protocol_name = ?
+                    """,
+                    (protocol_name,),
+                )
+                result = cur.fetchone()
+                return float(result[0]) if result and result[0] is not None else 0
+        except Exception as e:
+            print(f"Error in get_plan_revenue({protocol_name}): {e}")
+            return 0
+
+    def get_current_month_revenue(self):
+        """Get revenue recorded for the current month based on cycle start date."""
+        today = QDate.currentDate()
+        return self.get_month_revenue(today.year(), today.month())
+
+    def get_month_revenue(self, year, month):
+        """Get revenue for a specific month based on cycle start date."""
+        if not self.db:
+            return 0
+        try:
+            import sqlite3
+            total = 0.0
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT cycle_start_date, protocol_price_php
+                    FROM member_registrations
+                    """
+                )
+                for start_date, price in cur.fetchall():
+                    start_qdate = QDate.fromString(start_date or "", "MM/dd/yyyy")
+                    if not start_qdate.isValid():
+                        continue
+                    if start_qdate.year() == year and start_qdate.month() == month:
+                        total += float(price or 0)
+            return total
+        except Exception as e:
+            print(f"Error in get_month_revenue: {e}")
+            return 0
+
+    def get_plan_purchase_metrics(self):
+        """Get Weekly vs Monthly purchase counts and percentages."""
+        if not self.db:
+            return 0, 0, 0, 0, "NONE"
+
+        try:
+            import sqlite3
+            weekly_count = 0
+            monthly_count = 0
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT protocol_name, COUNT(*)
+                    FROM member_registrations
+                    WHERE protocol_name IN ('Weekly', 'Monthly')
+                    GROUP BY protocol_name
+                    """
+                )
+                for protocol_name, cnt in cur.fetchall():
+                    if protocol_name == "Weekly":
+                        weekly_count = cnt
+                    elif protocol_name == "Monthly":
+                        monthly_count = cnt
+
+            total = weekly_count + monthly_count
+            if total == 0:
+                return weekly_count, monthly_count, 0, 0, "NONE"
+
+            weekly_pct = int(round((weekly_count / total) * 100))
+            monthly_pct = max(0, 100 - weekly_pct)
+
+            if weekly_count > monthly_count:
+                leader = "WEEKLY"
+            elif monthly_count > weekly_count:
+                leader = "MONTHLY"
+            else:
+                leader = "TIE"
+
+            return weekly_count, monthly_count, weekly_pct, monthly_pct, leader
+        except Exception as e:
+            print(f"Error in get_plan_purchase_metrics: {e}")
+            return 0, 0, 0, 0, "NONE"
+
+    def update_plan_purchase_panel(self):
+        if not hasattr(self, "plan_purchase_widgets"):
+            return
+
+        weekly_count, monthly_count, weekly_pct, monthly_pct, leader = self.get_plan_purchase_metrics()
+
+        weekly_lbl = self.plan_purchase_widgets["weekly_pct_lbl"]
+        weekly_lbl.setText(f"{weekly_pct}% ({weekly_count})")
+        weekly_gauge = self.plan_purchase_widgets["weekly_gauge"]
+        weekly_gauge.value = weekly_pct
+        weekly_gauge.update()
+
+        monthly_lbl = self.plan_purchase_widgets["monthly_pct_lbl"]
+        monthly_lbl.setText(f"{monthly_pct}% ({monthly_count})")
+        monthly_gauge = self.plan_purchase_widgets["monthly_gauge"]
+        monthly_gauge.value = monthly_pct
+        monthly_gauge.update()
+
+        if leader == "WEEKLY":
+            self.plan_leader_lbl.setText("Most Purchased: WEEKLY")
+            self.plan_leader_lbl.setStyleSheet(label_style(9, "secondary", "bold", FONT_HEADLINE, 1))
+        elif leader == "MONTHLY":
+            self.plan_leader_lbl.setText("Most Purchased: MONTHLY")
+            self.plan_leader_lbl.setStyleSheet(label_style(9, "tertiary", "bold", FONT_HEADLINE, 1))
+        elif leader == "TIE":
+            self.plan_leader_lbl.setText("Most Purchased: TIE")
+            self.plan_leader_lbl.setStyleSheet(label_style(9, "on_surface_variant", "bold", FONT_HEADLINE, 1))
+        else:
+            self.plan_leader_lbl.setText("No purchases yet")
+            self.plan_leader_lbl.setStyleSheet(label_style(9, "on_surface_variant", "bold", FONT_HEADLINE, 1))
+
+    def update_revenue_panel(self):
+        if not hasattr(self, "revenue_total_lbl"):
+            return
+
+        overall_revenue = self.get_overall_revenue()
+        today = QDate.currentDate()
+        monthly_revenue = self.get_current_month_revenue()
+        prev_month_date = QDate(today.year(), today.month(), 1).addMonths(-1)
+        previous_month_revenue = self.get_month_revenue(prev_month_date.year(), prev_month_date.month())
+        monthly_share_pct = (monthly_revenue / overall_revenue * 100.0) if overall_revenue > 0 else 0.0
+
+        self.revenue_total_lbl.setText(f"{monthly_share_pct:.1f}%")
+        self.revenue_month_lbl.setText(f"THIS MONTH REVENUE: {php_currency(monthly_revenue)}")
+
+        if previous_month_revenue > 0:
+            change_pct = ((monthly_revenue - previous_month_revenue) / previous_month_revenue) * 100.0
+            if change_pct > 0:
+                self.revenue_change_lbl.setText(f"↑ +{change_pct:.1f}% VS LAST MONTH")
+                self.revenue_change_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+            elif change_pct < 0:
+                self.revenue_change_lbl.setText(f"↓ {change_pct:.1f}% VS LAST MONTH")
+                self.revenue_change_lbl.setStyleSheet(label_style(9, "tertiary", "medium", FONT_BODY))
+            else:
+                self.revenue_change_lbl.setText("0.0% VS LAST MONTH")
+                self.revenue_change_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+        elif monthly_revenue > 0:
+            self.revenue_change_lbl.setText("NEW REVENUE THIS MONTH")
+            self.revenue_change_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+        else:
+            self.revenue_change_lbl.setText("NO REVENUE ACTIVITY")
+            self.revenue_change_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+
+    def get_recent_checkins(self, limit=6):
+        """Get latest check-ins for today only (dashboard recent activity panel)."""
+        if not self.db:
+            return []
+
+        try:
+            import sqlite3
+            today_iso = QDate.currentDate().toString("yyyy-MM-dd")
+            today_us = QDate.currentDate().toString("MM/dd/yyyy")
+            with sqlite3.connect(self.db.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT member_name, member_id, checkin_date, checkin_time, registration_id
+                    FROM daily_checkins
+                    WHERE checkin_date = ?
+                       OR checkin_date LIKE ?
+                       OR checkin_date LIKE ?
+                    ORDER BY checkin_date DESC, checkin_time DESC
+                    LIMIT ?
+                    """,
+                    (today_iso, f"{today_iso}%", f"{today_us}%", limit),
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"Error in get_recent_checkins: {e}")
+            return []
+
+    def _format_checkin_display_time(self, checkin_date, checkin_time):
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        if not checkin_time:
+            return "--"
+        if checkin_date == today:
+            return checkin_time
+        if checkin_date:
+            return f"{checkin_date} {checkin_time}"
+        return checkin_time
+
+    def update_recent_activity_panel(self):
+        if not hasattr(self, "activity_rows_lay"):
+            return
+
+        while self.activity_rows_lay.count() > 0:
+            item = self.activity_rows_lay.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+
+        rows = self.get_recent_checkins(6)
+        if not rows:
+            empty_lbl = QLabel("No recent check-ins yet")
+            empty_lbl.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_BODY))
+            self.activity_rows_lay.addWidget(empty_lbl)
+            return
+
+        for member_name, member_id, checkin_date, checkin_time, registration_id in rows:
+            name = member_name or "Unknown"
+            detail = f"Check-in • {member_id or '--'}"
+            time_text = self._format_checkin_display_time(checkin_date, checkin_time)
+            status_color = C["secondary"] if registration_id else C["primary"]
+            row = ActivityRow(name, detail, time_text, status_color)
+            self.activity_rows_lay.addWidget(row)
 
     def get_today_checkins(self, period="Overall"):
         """Get today's activity by selected period.
@@ -1227,61 +1508,57 @@ class DashboardPage(QWidget):
                     protocol_filter = None
 
                 if protocol_filter:
-                    cur = conn.execute(
+                    checkin_cur = conn.execute(
                         """
-                        SELECT
-                            (
-                                SELECT COUNT(*)
-                                FROM daily_checkins dc
-                                JOIN member_registrations mr ON mr.id = dc.registration_id
-                                WHERE (dc.checkin_date LIKE ? OR dc.checkin_date LIKE ?)
-                                  AND mr.protocol_name = ?
-                            )
-                            +
-                            (
-                                SELECT COUNT(*)
-                                FROM member_registrations
-                                WHERE (created_at LIKE ? OR created_at LIKE ?)
-                                  AND protocol_name = ?
-                            )
+                                                SELECT mr.cycle_expiration_date
+                        FROM daily_checkins dc
+                        JOIN member_registrations mr ON mr.id = dc.registration_id
+                        WHERE (dc.checkin_date LIKE ? OR dc.checkin_date LIKE ?)
+                          AND mr.protocol_name = ?
                         """,
-                        (
-                            f"{today_iso}%",
-                            f"{today_us}%",
-                            protocol_filter,
-                            f"{today_iso}%",
-                            f"{today_us}%",
-                            protocol_filter,
-                        ),
+                        (f"{today_iso}%", f"{today_us}%", protocol_filter),
+                    )
+                    reg_cur = conn.execute(
+                        """
+                                                SELECT cycle_expiration_date
+                        FROM member_registrations
+                        WHERE (created_at LIKE ? OR created_at LIKE ?)
+                          AND protocol_name = ?
+                        """,
+                        (f"{today_iso}%", f"{today_us}%", protocol_filter),
                     )
                 else:
-                    cur = conn.execute(
+                    checkin_cur = conn.execute(
                         """
-                        SELECT
-                            (
-                                SELECT COUNT(*)
-                                FROM daily_checkins dc
-                                JOIN member_registrations mr ON mr.id = dc.registration_id
-                                WHERE (dc.checkin_date LIKE ? OR dc.checkin_date LIKE ?)
-                                  AND mr.protocol_name IN ('Weekly', 'Monthly')
-                            )
-                            +
-                            (
-                                SELECT COUNT(*)
-                                FROM member_registrations
-                                WHERE (created_at LIKE ? OR created_at LIKE ?)
-                                  AND protocol_name IN ('Weekly', 'Monthly')
-                            )
+                                                SELECT mr.cycle_expiration_date
+                        FROM daily_checkins dc
+                        JOIN member_registrations mr ON mr.id = dc.registration_id
+                        WHERE (dc.checkin_date LIKE ? OR dc.checkin_date LIKE ?)
+                          AND mr.protocol_name IN ('Weekly', 'Monthly')
                         """,
-                        (
-                            f"{today_iso}%",
-                            f"{today_us}%",
-                            f"{today_iso}%",
-                            f"{today_us}%",
-                        ),
+                        (f"{today_iso}%", f"{today_us}%"),
                     )
-                result = cur.fetchone()
-                return result[0] if result else 0
+                    reg_cur = conn.execute(
+                        """
+                                                SELECT cycle_expiration_date
+                        FROM member_registrations
+                        WHERE (created_at LIKE ? OR created_at LIKE ?)
+                          AND protocol_name IN ('Weekly', 'Monthly')
+                        """,
+                        (f"{today_iso}%", f"{today_us}%"),
+                    )
+
+                active_checkins = sum(
+                    1
+                    for (expiration_date,) in checkin_cur.fetchall()
+                    if self._is_active_membership(expiration_date)
+                )
+                active_registrations = sum(
+                    1
+                    for (expiration_date,) in reg_cur.fetchall()
+                    if self._is_active_membership(expiration_date)
+                )
+                return active_checkins + active_registrations
         except Exception as e:
             print(f"Error in get_today_checkins: {e}")
             return 0
@@ -1292,6 +1569,10 @@ class DashboardPage(QWidget):
         overall = self.get_overall_checkins()
         weekly = self.get_weekly_checkins()
         monthly = self.get_monthly_checkins()
+        active_memberships = self.get_active_memberships()
+        overall_revenue = self.get_overall_revenue()
+        weekly_revenue = self.get_plan_revenue("Weekly")
+        monthly_revenue_by_plan = self.get_plan_revenue("Monthly")
         # Today metric follows the selected period.
         if hasattr(self, 'period_combo'):
             selected_period = self.period_combo.currentText()
@@ -1315,27 +1596,31 @@ class DashboardPage(QWidget):
             stats = [
                 ("WEEKLY CHECKIN", str(weekly), f"↑ {weekly} MEMBERS", "secondary"),
                 ("TODAY'S CHECK-INS", str(today_checkins), "WEEKLY PLAN TODAY", "primary"),
-                ("TREND", f"↑ {max(0, weekly - 5)}%", "⚠ COMPARED TO LAST WEEK", "tertiary"),
-                ("MONTHLY REVENUE", php_currency(42850), f"🎯 TARGET: {php_currency(45000)}", "secondary"),
+                ("ACTIVE MEMBERSHIPS", str(active_memberships), "CURRENTLY ACTIVE", "tertiary"),
+                ("WEEKLY REVENUE", php_currency(weekly_revenue), f"🎯 TARGET: {php_currency(45000)}", "secondary"),
             ]
         elif current_period == "Monthly":
             stats = [
                 ("MONTHLY CHECKIN", str(monthly), f"↑ {monthly} MEMBERS", "secondary"),
                 ("TODAY'S CHECK-INS", str(today_checkins), "MONTHLY PLAN TODAY", "primary"),
-                ("AVERAGE/DAY", str(monthly // 30), " 30 DAYS TRACKING", "tertiary"),
-                ("MONTHLY REVENUE", php_currency(42850), f"TARGET: {php_currency(45000)}", "secondary"),
+                ("ACTIVE MEMBERSHIPS", str(active_memberships), "CURRENTLY ACTIVE", "tertiary"),
+                ("MONTHLY REVENUE", php_currency(monthly_revenue_by_plan), f"TARGET: {php_currency(45000)}", "secondary"),
             ]
         else:  # Overall
             stats = [
                 ("OVERALL CHECKIN", str(overall), f"↑ {weekly} THIS WEEK", "secondary"),
                 ("TODAY'S CHECK-INS", str(today_checkins), "WEEKLY + MONTHLY TOTAL TODAY", "primary"),
-                ("MONTHLY CHECKINS", str(monthly), "30 DAYS TRACKING", "tertiary"),
-                ("MONTHLY REVENUE", php_currency(42850), f" TARGET: {php_currency(45000)}", "secondary"),
+                ("ACTIVE MEMBERSHIPS", str(active_memberships), "CURRENTLY ACTIVE", "tertiary"),
+                ("OVERALL REVENUE", php_currency(overall_revenue), f" TARGET: {php_currency(45000)}", "secondary"),
             ]
         
         for label, val, sub, col in stats:
             card = StatCard(label, val, sub, col)
             self.stat_row.addWidget(card)
+
+        self.update_plan_purchase_panel()
+        self.update_revenue_panel()
+        self.update_recent_activity_panel()
 
     def _build(self):
         scroll = QScrollArea(self)
@@ -1470,21 +1755,17 @@ class DashboardPage(QWidget):
         act_title.setStyleSheet(label_style(14, "on_surface", "bold", FONT_HEADLINE))
         act_lay.addWidget(act_title)
 
-        activities = [
-            ("Alex Rivera", "Checked in • PLATINUM LEVEL", "2M AGO", C["secondary"]),
-            ("Sarah Chen", "Membership Renewal Needed", "14M AGO", C["tertiary"]),
-            ("Marcus Thorne", "Logged Workout: Heavy Back", "28M AGO", C["secondary"]),
-            ("Jordyn Miles", "New Member Onboarding", "45M AGO", C["primary"]),
-        ]
-        for name, detail, t, col in activities:
-            row = ActivityRow(name, detail, t, col)
-            act_lay.addWidget(row)
+        self.activity_rows_lay = QVBoxLayout()
+        self.activity_rows_lay.setSpacing(0)
+        act_lay.addLayout(self.activity_rows_lay)
 
         view_btn = QPushButton("VIEW AUDIT LOG")
         view_btn.setFixedHeight(34)
         view_btn.setStyleSheet(btn_secondary_style())
         act_lay.addSpacing(8)
         act_lay.addWidget(view_btn)
+
+        self.update_recent_activity_panel()
         mid_row.addWidget(act_card, 2)
 
         lay.addLayout(mid_row)
@@ -1493,38 +1774,52 @@ class DashboardPage(QWidget):
         bot_row = QHBoxLayout()
         bot_row.setSpacing(12)
 
-        # Zone Density
+        # Plan Purchaseability
         zone_card = QFrame()
         zone_card.setStyleSheet(card_style("surface_container"))
         zone_lay = QVBoxLayout(zone_card)
         zone_lay.setContentsMargins(20, 18, 20, 18)
         zone_lay.setSpacing(8)
 
-        zt = QLabel("Zone Density")
+        zt = QLabel("Plan Purchaseability")
         zt.setStyleSheet(label_style(15, "on_surface", "bold", FONT_HEADLINE))
-        zs = QLabel("Real-time floor occupancy")
+        zs = QLabel("Weekly vs Monthly membership preference")
         zs.setStyleSheet(label_style(10, "on_surface_variant"))
         zone_lay.addWidget(zt)
         zone_lay.addWidget(zs)
         zone_lay.addSpacing(12)
 
-        for zone, pct, col in [("FREE WEIGHTS", 95, "tertiary"), ("CARDIO HUB", 42, "secondary")]:
+        self.plan_purchase_widgets = {}
+
+        for plan_name, key, col in [
+            ("WEEKLY MEMBERSHIP PLAN", "weekly", "secondary"),
+            ("MONTHLY MEMBERSHIP PLAN", "monthly", "tertiary"),
+        ]:
             zr = QHBoxLayout()
-            zl = QLabel(zone)
+            zl = QLabel(plan_name)
             zl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
-            zp = QLabel(f"{pct}%")
+            zp = QLabel("0% (0)")
             zp.setStyleSheet(label_style(9, col, "bold", FONT_HEADLINE))
             zr.addWidget(zl)
             zr.addStretch()
             zr.addWidget(zp)
             zone_lay.addLayout(zr)
-            gauge = PowerGauge(pct, 100, zone, col)
+            gauge = PowerGauge(0, 100, plan_name, col)
             zone_lay.addWidget(gauge)
             zone_lay.addSpacing(4)
 
+            self.plan_purchase_widgets[f"{key}_pct_lbl"] = zp
+            self.plan_purchase_widgets[f"{key}_gauge"] = gauge
+
+        self.plan_leader_lbl = QLabel("No purchases yet")
+        self.plan_leader_lbl.setStyleSheet(label_style(9, "on_surface_variant", "bold", FONT_HEADLINE, 1))
+        zone_lay.addWidget(self.plan_leader_lbl)
+
+        self.update_plan_purchase_panel()
+
         bot_row.addWidget(zone_card, 3)
 
-        # Member Retention
+        # Revenue Insights
         ret_card = QFrame()
         ret_card.setStyleSheet(card_style("surface_container"))
         ret_lay = QVBoxLayout(ret_card)
@@ -1532,7 +1827,7 @@ class DashboardPage(QWidget):
         ret_lay.setSpacing(8)
 
         rr = QHBoxLayout()
-        rt = QLabel("Member Retention")
+        rt = QLabel("Revenue Insights")
         rt.setStyleSheet(label_style(15, "on_surface", "bold", FONT_HEADLINE))
         rr.addWidget(rt)
         rr.addStretch()
@@ -1540,18 +1835,23 @@ class DashboardPage(QWidget):
         ri.setFixedSize(32, 32)
         ri.setStyleSheet(f"background: {C['primary_container']}; color: {C['primary']}; border: none; border-radius: 6px; font-size: 14px;")
         rr.addWidget(ri)
-        rs = QLabel("Quarterly growth trajectory")
+        rs = QLabel("Live membership revenue overview")
         rs.setStyleSheet(label_style(10, "on_surface_variant"))
         ret_lay.addLayout(rr)
         ret_lay.addWidget(rs)
         ret_lay.addSpacing(8)
 
-        big_pct = QLabel("94.2%")
-        big_pct.setStyleSheet(f"color: {C['on_surface']}; font-family: '{FONT_HEADLINE}'; font-size: 40px; font-weight: 800;")
-        sub_pct = QLabel("+2.4% FROM LAST QTR")
-        sub_pct.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
-        ret_lay.addWidget(big_pct)
-        ret_lay.addWidget(sub_pct)
+        self.revenue_total_lbl = QLabel("0.0%")
+        self.revenue_total_lbl.setStyleSheet(f"color: {C['on_surface']}; font-family: '{FONT_HEADLINE}'; font-size: 40px; font-weight: 800;")
+        self.revenue_month_lbl = QLabel("THIS MONTH REVENUE: ₱0")
+        self.revenue_month_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+        self.revenue_change_lbl = QLabel("0.0% VS LAST MONTH")
+        self.revenue_change_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+        ret_lay.addWidget(self.revenue_total_lbl)
+        ret_lay.addWidget(self.revenue_month_lbl)
+        ret_lay.addWidget(self.revenue_change_lbl)
+
+        self.update_revenue_panel()
 
         bot_row.addWidget(ret_card, 2)
         lay.addLayout(bot_row)
@@ -2504,6 +2804,92 @@ class QRCheckInPage(QWidget):
         self.setStyleSheet(f"background: {C['background']};")
         self._build()
         self.refresh_today_checkins()
+        self._banner_timer = QTimer(self)
+        self._banner_timer.timeout.connect(self._update_checkin_banner_live)
+        self._banner_timer.start(1200)
+        self._update_checkin_banner_live()
+
+    def _get_latest_today_member_info(self):
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        with sqlite3.connect(self.db.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT dc.member_id, mr.protocol_name
+                FROM daily_checkins dc
+                JOIN member_registrations mr ON mr.id = dc.registration_id
+                WHERE dc.checkin_date = ? AND dc.registration_id IS NOT NULL
+                ORDER BY dc.checkin_time DESC
+                LIMIT 1
+                """,
+                (today,),
+            )
+            row = cur.fetchone()
+        return row if row else None
+
+    def _set_checkin_banner_text(self, top, bottom=""):
+        if bottom:
+            # Keep two-line real-time data compact and readable.
+            max_bottom_len = 24
+            compact_bottom = bottom if len(bottom) <= max_bottom_len else f"{bottom[:max_bottom_len-1]}…"
+            self.qr_frame_lbl.setText(f"{top}\n{compact_bottom}")
+            self.qr_frame_lbl.setStyleSheet(f"""
+                color: {C['primary']};
+                background: {C['surface_container_lowest']};
+                border: 2px solid {C['primary']}CC;
+                border-radius: 10px;
+                font-family: '{FONT_HEADLINE}';
+                font-size: 14px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                padding: 10px 12px;
+            """)
+        else:
+            self.qr_frame_lbl.setText(top)
+            self.qr_frame_lbl.setStyleSheet(f"""
+                color: {C['primary']};
+                background: {C['surface_container_lowest']};
+                border: 2px dashed {C['primary']};
+                border-radius: 10px;
+                font-family: '{FONT_HEADLINE}';
+                font-size: 24px;
+                font-weight: 700;
+                letter-spacing: 3px;
+                padding: 8px;
+            """)
+
+    def _update_checkin_banner_live(self):
+        if not hasattr(self, "qr_frame_lbl"):
+            return
+
+        token = self.scan_input.text().strip() if hasattr(self, "scan_input") else ""
+        if token:
+            member = self.db.find_member_for_checkin(token)
+            if member and member.get("member_id"):
+                plan = (member.get("protocol_name") or "--").upper()
+                self._set_checkin_banner_text("MEMBER ID", f"{member['member_id']} • {plan}")
+                return
+            self._set_checkin_banner_text("MEMBER ID", "NOT FOUND")
+            return
+
+        latest_member_info = self._get_latest_today_member_info()
+        if latest_member_info:
+            member_id, plan = latest_member_info
+            self._set_checkin_banner_text("LATEST CHECK-IN", f"{member_id} • {(plan or '--').upper()}")
+
+            # Keep member info card updated in real time when no manual input is being typed.
+            if not self.walkin_input.text().strip():
+                member = self.db.find_member_for_checkin(member_id)
+                if member:
+                    self.current_member = member
+                    self._populate_member_card(member)
+                    status = "ACTIVE" if self._member_is_active(member) else "EXPIRED"
+                    self.membership_id_preview_lbl.setText(f"Membership ID: {member['member_id']} ({status})")
+        else:
+            self._set_checkin_banner_text("CHECK-IN")
+            if not self.walkin_input.text().strip():
+                self.membership_id_preview_lbl.setText("Membership ID: --")
+                self.current_member = None
+                self._reset_member_card()
 
     def _member_is_active(self, member):
         start_date = QDate.fromString(member["cycle_start_date"], "MM/dd/yyyy")
@@ -2586,6 +2972,7 @@ class QRCheckInPage(QWidget):
             self.current_member = None
             if not self.walkin_input.text().strip():
                 self._reset_member_card()
+            self._update_checkin_banner_live()
             return
 
         member = self.db.find_member_for_checkin(token)
@@ -2594,12 +2981,29 @@ class QRCheckInPage(QWidget):
             self.current_member = None
             if not self.walkin_input.text().strip():
                 self._reset_member_card()
+            self._update_checkin_banner_live()
             return
 
         self.current_member = member
         self._populate_member_card(member)
         status = "ACTIVE" if self._member_is_active(member) else "EXPIRED"
         self.membership_id_preview_lbl.setText(f"Membership ID: {member['member_id']} ({status})")
+        self._update_checkin_banner_live()
+
+    def _on_checkin_banner_clicked(self, event):
+        token = self.scan_input.text().strip()
+        if token:
+            self._update_membership_id_preview(token)
+            return
+
+        latest_member_info = self._get_latest_today_member_info()
+        if not latest_member_info:
+            QMessageBox.information(self, "No Member Check-In", "No registered member check-in found for today.")
+            return
+
+        latest_member_id, _ = latest_member_info
+        self.scan_input.setText(latest_member_id)
+        self._update_membership_id_preview(latest_member_id)
 
     def _save_walkin_checkin(self, walkin_name):
         clean_name = " ".join((walkin_name or "").strip().split())
@@ -2617,6 +3021,7 @@ class QRCheckInPage(QWidget):
             self.scan_input.clear()
             self._update_walkin_id_preview("")
             self._update_membership_id_preview("")
+            self._update_checkin_banner_live()
             # Emit signal to refresh record user page
             self.checkin_completed.emit()
             return
@@ -2665,6 +3070,7 @@ class QRCheckInPage(QWidget):
             self.refresh_today_checkins()
             self.scan_input.clear()
             self.walkin_input.clear()
+            self._update_checkin_banner_live()
             # Emit signal to refresh record user page
             self.checkin_completed.emit()
             return
@@ -2714,19 +3120,25 @@ class QRCheckInPage(QWidget):
         cam_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         qr_frame = QLabel("CHECK-IN")
-        qr_frame.setFixedSize(180, 120)
+        qr_frame.setFixedSize(280, 140)
         qr_frame.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qr_frame.setWordWrap(True)
         qr_frame.setStyleSheet(f"""
             color: {C['primary']};
+            background: {C['surface_container_lowest']};
             border: 2px dashed {C['primary']};
-            border-radius: 6px;
+            border-radius: 10px;
             font-family: '{FONT_HEADLINE}';
             font-size: 24px;
             font-weight: 700;
             letter-spacing: 3px;
+            padding: 8px;
         """)
+        self.qr_frame_lbl = qr_frame
+        qr_frame.setCursor(Qt.CursorShape.PointingHandCursor)
+        qr_frame.mousePressEvent = self._on_checkin_banner_clicked
 
-        cam_sub = QLabel("Member ID/phone for registered members, walk-in name for non-members")
+        cam_sub = QLabel("Use Member ID/phone for members, or walk-in full name for guests")
         cam_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cam_sub.setStyleSheet(f"""
             background: {C['background']}80;
@@ -3620,10 +4032,10 @@ class RecordUserPage(QWidget):
         
         # Update table columns based on filter type
         if filter_type == "MEMBERSHIP":
-            # Membership: show Name, Member ID, Start Date, Expiration Date, Station
+            # Membership: show Name, Member ID, Start Date, Expiration Date, Status
             self.table.setColumnCount(5)
             self.table.setHorizontalHeaderLabels([
-                "Name", "Member ID", "Start Date", "Expiration Date", "Station",
+                "Name", "Member ID", "Start Date", "Expiration Date", "Status",
             ])
             self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -3650,6 +4062,12 @@ class RecordUserPage(QWidget):
         self.period_filter = period
         self.refresh_records()
 
+    def _membership_status(self, expiration_date):
+        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        if not expiry.isValid():
+            return "INACTIVE"
+        return "ACTIVE" if QDate.currentDate() <= expiry else "INACTIVE"
+
     def refresh_records(self):
         # Get records from database based on filter
         search_text = self.search_input.text().lower().strip()
@@ -3664,7 +4082,7 @@ class RecordUserPage(QWidget):
                 if self.period_filter == "Weekly":
                     cur = conn.execute(
                         """
-                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, id
                         FROM member_registrations
                         WHERE protocol_name = 'Weekly'
                         ORDER BY id DESC
@@ -3673,7 +4091,7 @@ class RecordUserPage(QWidget):
                 elif self.period_filter == "Monthly":
                     cur = conn.execute(
                         """
-                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, id
                         FROM member_registrations
                         WHERE protocol_name = 'Monthly'
                         ORDER BY id DESC
@@ -3682,7 +4100,7 @@ class RecordUserPage(QWidget):
                 else:
                     cur = conn.execute(
                         """
-                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, 'STATION 04', id
+                        SELECT id, full_name, member_id, cycle_start_date, cycle_expiration_date, id
                         FROM member_registrations
                         ORDER BY id DESC
                         """
@@ -3722,8 +4140,8 @@ class RecordUserPage(QWidget):
         for rec in all_records:
             # Unpack based on filter type
             if self.current_filter == "MEMBERSHIP":
-                # MEMBERSHIP: id, name, member_id, start_date, expiration_date, station, reg_id
-                rec_id, name, member_id, start_date, expiration_date, station, reg_id = rec
+                # MEMBERSHIP: id, name, member_id, start_date, expiration_date, reg_id
+                rec_id, name, member_id, start_date, expiration_date, reg_id = rec
             else:
                 # ALL and WALKIN: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
                 checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id = rec
@@ -3739,15 +4157,16 @@ class RecordUserPage(QWidget):
         for r, rec in enumerate(filtered_records):
             # Display based on filter type - records have different structures
             if self.current_filter == "MEMBERSHIP":
-                # MEMBERSHIP filter records: id, name, member_id, start_date, expiration_date, station, reg_id
-                rec_id, name, member_id, start_date, expiration_date, station, reg_id = rec
+                # MEMBERSHIP filter records: id, name, member_id, start_date, expiration_date, reg_id
+                rec_id, name, member_id, start_date, expiration_date, reg_id = rec
+                status = self._membership_status(expiration_date)
                 
                 values = [
                     name,
                     member_id or "--",
                     start_date or "--",
                     expiration_date or "--",
-                    station,
+                    status,
                 ]
             else:
                 # ALL and WALKIN filter records: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
