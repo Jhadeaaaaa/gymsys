@@ -290,6 +290,82 @@ class RegistrationDatabase:
         except sqlite3.IntegrityError:
             return False, "This walk-in guest is already checked in today.", walkin_member_id
 
+    def get_existing_walkin_checkin(self, walkin_name, target_date=None):
+        clean_name = " ".join((walkin_name or "").strip().split())
+        if not clean_name:
+            return None
+
+        check_date = target_date or QDate.currentDate().toString("yyyy-MM-dd")
+        normalized_date_expr = """
+            CASE
+                WHEN instr(checkin_date, '/') > 0 THEN
+                    substr(checkin_date, 7, 4) || '-' || substr(checkin_date, 1, 2) || '-' || substr(checkin_date, 4, 2)
+                ELSE
+                    substr(checkin_date, 1, 10)
+            END
+        """
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                f"""
+                SELECT id, member_name, member_id, checkin_date, checkin_time, checkout_time, station
+                FROM daily_checkins
+                WHERE registration_id IS NULL
+                AND UPPER(TRIM(member_name)) = UPPER(?)
+                AND {normalized_date_expr} = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (clean_name, check_date),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return None
+
+        rec_id, member_name, member_id, checkin_date, checkin_time, checkout_time, station = row
+        return {
+            "id": rec_id,
+            "member_name": member_name,
+            "member_id": member_id,
+            "checkin_date": checkin_date,
+            "checkin_time": checkin_time,
+            "checkout_time": checkout_time,
+            "station": station,
+        }
+
+    def record_walkin_checkout(self, checkin_id):
+        now_time = QDateTime.currentDateTime().toString("HH:mm:ss")
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT checkout_time
+                FROM daily_checkins
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (checkin_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, "Walk-in check-in record not found.", None
+
+            existing_checkout_time = row[0]
+            if existing_checkout_time:
+                return False, "This walk-in guest is already checked out today.", existing_checkout_time
+
+            conn.execute(
+                """
+                UPDATE daily_checkins
+                SET checkout_time = ?
+                WHERE id = ?
+                """,
+                (now_time, checkin_id),
+            )
+            conn.commit()
+
+        return True, f"Walk-in check-out saved at {now_time}.", now_time
+
     def get_today_checkins(self):
         today = QDate.currentDate().toString("yyyy-MM-dd")
         with sqlite3.connect(self.db_path) as conn:
@@ -2948,14 +3024,21 @@ class QRCheckInPage(QWidget):
         self.member_start_lbl.setText(f"START DATE: {member['cycle_start_date']}")
         self.member_phone_lbl.setText(f"PHONE: {member['phone']}")
 
-    def _populate_walkin_card(self, walkin_name, walkin_member_id):
+    def _populate_walkin_card(self, walkin_name, walkin_member_id, checkin_date=None, checkin_time=None, checkout_time=None):
         initials = "".join(part[0] for part in walkin_name.split() if part)[:2].upper() or "WI"
         self.avatar_lbl.setText(initials)
         self.member_name_lbl.setText(walkin_name)
         self.member_id_lbl.setText(f"ID: {walkin_member_id}")
-        self.member_plan_lbl.setText("PLAN: WALK-IN (TODAY ONLY)")
-        self.member_start_lbl.setText(f"CHECK-IN DATE: {QDate.currentDate().toString('MM/dd/yyyy')}")
-        self.member_phone_lbl.setText("PHONE: --")
+        self.member_plan_lbl.setText("PLAN: WALK-IN (TODAY ONLY)" if not checkout_time else "PLAN: WALK-IN (COMPLETED)")
+
+        if checkin_date and checkin_time:
+            self.member_start_lbl.setText(f"CHECK-IN: {checkin_date} {checkin_time}")
+        elif checkin_date:
+            self.member_start_lbl.setText(f"CHECK-IN DATE: {checkin_date}")
+        else:
+            self.member_start_lbl.setText(f"CHECK-IN DATE: {QDate.currentDate().toString('MM/dd/yyyy')}")
+
+        self.member_phone_lbl.setText(f"CHECK-OUT TIME: {checkout_time or '--'}")
 
     def _update_walkin_id_preview(self, text):
         clean_name = " ".join((text or "").strip().split())
@@ -2964,6 +3047,43 @@ class QRCheckInPage(QWidget):
             return
         generated_id = self.db.generate_walkin_member_id(clean_name)
         self.walkin_id_preview_lbl.setText(f"Generated ID: {generated_id}")
+
+    def _update_existing_walkin_preview(self, text):
+        clean_name = " ".join((text or "").strip().split())
+        if not clean_name:
+            self.walkin_existing_lbl.setText("Existing today: --")
+            self.walkin_existing_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+            if not self.scan_input.text().strip():
+                self._reset_member_card()
+            self._update_checkin_banner_live()
+            return
+
+        existing = self.db.get_existing_walkin_checkin(clean_name)
+        if not existing:
+            self.walkin_existing_lbl.setText("Existing today: none")
+            self.walkin_existing_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+            return
+
+        checkin_time = existing.get("checkin_time") or "--"
+        checkout_time = existing.get("checkout_time")
+        if checkout_time:
+            self.walkin_existing_lbl.setText(f"Existing today: IN {checkin_time} | OUT {checkout_time}")
+            self.walkin_existing_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+        else:
+            self.walkin_existing_lbl.setText(f"Existing today: IN {checkin_time} | save to set OUT")
+            self.walkin_existing_lbl.setStyleSheet(label_style(9, "tertiary", "medium", FONT_BODY))
+
+        self._populate_walkin_card(
+            existing["member_name"],
+            existing["member_id"],
+            existing.get("checkin_date"),
+            existing.get("checkin_time"),
+            existing.get("checkout_time"),
+        )
+
+    def _on_walkin_input_changed(self, text):
+        self._update_walkin_id_preview(text)
+        self._update_existing_walkin_preview(text)
 
     def _update_membership_id_preview(self, text):
         token = (text or "").strip()
@@ -3011,6 +3131,52 @@ class QRCheckInPage(QWidget):
             QMessageBox.warning(self, "Missing Name", "Enter walk-in name for non-member check-in.")
             return
 
+        existing = self.db.get_existing_walkin_checkin(clean_name)
+        if existing:
+            existing_checkout_time = existing.get("checkout_time")
+            if existing_checkout_time:
+                self._populate_walkin_card(
+                    existing["member_name"],
+                    existing["member_id"],
+                    existing.get("checkin_date"),
+                    existing.get("checkin_time"),
+                    existing_checkout_time,
+                )
+                self._set_access_style("already", "Walk-in already checked out today")
+                QMessageBox.information(
+                    self,
+                    "Already Checked-Out",
+                    f"Walk-in already checked out at {existing_checkout_time}.",
+                )
+                self.refresh_today_checkins()
+                return
+
+            success, message, checkout_time = self.db.record_walkin_checkout(existing["id"])
+            if success:
+                self._populate_walkin_card(
+                    existing["member_name"],
+                    existing["member_id"],
+                    existing.get("checkin_date"),
+                    existing.get("checkin_time"),
+                    checkout_time,
+                )
+                self._set_access_style("granted", f"Walk-in checked out ({existing.get('checkin_time') or '--'} in)")
+                QMessageBox.information(self, "Walk-In Checked-Out", message)
+                self.refresh_today_checkins()
+                self.walkin_input.clear()
+                self.scan_input.clear()
+                self._update_walkin_id_preview("")
+                self._update_existing_walkin_preview("")
+                self._update_membership_id_preview("")
+                self._update_checkin_banner_live()
+                self.checkin_completed.emit()
+                return
+
+            self._set_access_style("already", "Walk-in checkout unavailable")
+            QMessageBox.information(self, "Walk-In Checkout", message)
+            self.refresh_today_checkins()
+            return
+
         success, message, walkin_member_id = self.db.record_walkin_checkin(clean_name)
         if success:
             self._populate_walkin_card(clean_name, walkin_member_id)
@@ -3020,6 +3186,7 @@ class QRCheckInPage(QWidget):
             self.walkin_input.clear()
             self.scan_input.clear()
             self._update_walkin_id_preview("")
+            self._update_existing_walkin_preview("")
             self._update_membership_id_preview("")
             self._update_checkin_banner_live()
             # Emit signal to refresh record user page
@@ -3138,7 +3305,7 @@ class QRCheckInPage(QWidget):
         qr_frame.setCursor(Qt.CursorShape.PointingHandCursor)
         qr_frame.mousePressEvent = self._on_checkin_banner_clicked
 
-        cam_sub = QLabel("Use Member ID/phone for members, or walk-in full name for guests")
+        cam_sub = QLabel("Use Member ID/phone for members. Re-enter same walk-in name to save checkout.")
         cam_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cam_sub.setStyleSheet(f"""
             background: {C['background']}80;
@@ -3156,7 +3323,16 @@ class QRCheckInPage(QWidget):
         input_card.setStyleSheet(card_style("surface_container"))
         input_lay = QVBoxLayout(input_card)
         input_lay.setContentsMargins(14, 12, 14, 12)
-        input_lay.setSpacing(8)
+        input_lay.setSpacing(10)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(10)
+
+        lookup_card = QFrame()
+        lookup_card.setStyleSheet(card_style("surface_container_high"))
+        lookup_lay = QVBoxLayout(lookup_card)
+        lookup_lay.setContentsMargins(12, 10, 12, 10)
+        lookup_lay.setSpacing(6)
 
         input_title = QLabel("MEMBER LOOKUP")
         input_title.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
@@ -3170,29 +3346,46 @@ class QRCheckInPage(QWidget):
         self.membership_id_preview_lbl = QLabel("Membership ID: --")
         self.membership_id_preview_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_HEADLINE, 1))
 
+        lookup_lay.addWidget(input_title)
+        lookup_lay.addWidget(self.scan_input)
+        lookup_lay.addWidget(self.membership_id_preview_lbl)
+
         walkin_title = QLabel("WALK-IN NAME (NO MEMBERSHIP)")
         walkin_title.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
+
+        walkin_card = QFrame()
+        walkin_card.setStyleSheet(card_style("surface_container_high"))
+        walkin_lay = QVBoxLayout(walkin_card)
+        walkin_lay.setContentsMargins(12, 10, 12, 10)
+        walkin_lay.setSpacing(6)
+
         self.walkin_input = QLineEdit()
         self.walkin_input.setPlaceholderText("Enter full name for today-only walk-in")
         self.walkin_input.setFixedHeight(40)
         self.walkin_input.setStyleSheet(input_style())
         self.walkin_input.returnPressed.connect(self._handle_check_in)
-        self.walkin_input.textChanged.connect(self._update_walkin_id_preview)
+        self.walkin_input.textChanged.connect(self._on_walkin_input_changed)
 
         self.walkin_id_preview_lbl = QLabel("Generated ID: --")
         self.walkin_id_preview_lbl.setStyleSheet(label_style(9, "primary", "medium", FONT_HEADLINE, 1))
 
-        checkin_btn = QPushButton("SAVE TODAY CHECK-IN")
+        self.walkin_existing_lbl = QLabel("Existing today: --")
+        self.walkin_existing_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+
+        walkin_lay.addWidget(walkin_title)
+        walkin_lay.addWidget(self.walkin_input)
+        walkin_lay.addWidget(self.walkin_id_preview_lbl)
+        walkin_lay.addWidget(self.walkin_existing_lbl)
+
+        input_row.addWidget(lookup_card, 1)
+        input_row.addWidget(walkin_card, 1)
+
+        checkin_btn = QPushButton("SAVE CHECK-IN / CHECK-OUT")
         checkin_btn.setFixedHeight(42)
         checkin_btn.setStyleSheet(btn_primary_style())
         checkin_btn.clicked.connect(self._handle_check_in)
 
-        input_lay.addWidget(input_title)
-        input_lay.addWidget(self.scan_input)
-        input_lay.addWidget(self.membership_id_preview_lbl)
-        input_lay.addWidget(walkin_title)
-        input_lay.addWidget(self.walkin_input)
-        input_lay.addWidget(self.walkin_id_preview_lbl)
+        input_lay.addLayout(input_row)
         input_lay.addWidget(checkin_btn)
         left.addWidget(input_card)
 
@@ -4073,8 +4266,18 @@ class RecordUserPage(QWidget):
         search_text = self.search_input.text().lower().strip()
         all_records = []
         
-        # Get selected date from the date picker
-        selected_date = self.date_edit.date().toString("yyyy-MM-dd")
+        selected_qdate = self.date_edit.date()
+        selected_date_iso = selected_qdate.toString("yyyy-MM-dd")
+
+        # Normalize legacy date formats (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, MM/DD/YYYY)
+        normalized_checkin_date_expr = """
+            CASE
+                WHEN instr(checkin_date, '/') > 0 THEN
+                    substr(checkin_date, 7, 4) || '-' || substr(checkin_date, 1, 2) || '-' || substr(checkin_date, 4, 2)
+                ELSE
+                    substr(checkin_date, 1, 10)
+            END
+        """
 
         with sqlite3.connect(self.db.db_path) as conn:
             if self.current_filter == "MEMBERSHIP":
@@ -4110,28 +4313,41 @@ class RecordUserPage(QWidget):
             elif self.current_filter == "WALKIN":
                 # Only walk-in check-ins for the selected date
                 cur = conn.execute(
-                    """
+                    f"""
                     SELECT id, member_name, member_id, checkin_date, checkin_time, 
                         checkout_time, station, registration_id
                     FROM daily_checkins
-                    WHERE registration_id IS NULL AND checkin_date = ?
+                    WHERE registration_id IS NULL
+                    AND {normalized_checkin_date_expr} = ?
                     ORDER BY checkin_time DESC
                     """,
-                    (selected_date,)
+                    (selected_date_iso,),
                 )
                 all_records = cur.fetchall()
                 
             else:  # ALL
-                # All check-ins (both members and walk-ins) for the selected date
+                # ALL + Overall: show all check-ins on selected date.
+                # ALL + Weekly/Monthly: show date window anchored to selected date.
+                where_clause = f"WHERE {normalized_checkin_date_expr} = ?"
+                params = (selected_date_iso,)
+                if self.period_filter == "Weekly":
+                    start_date_iso = selected_qdate.addDays(-6).toString("yyyy-MM-dd")
+                    where_clause = f"WHERE {normalized_checkin_date_expr} BETWEEN ? AND ?"
+                    params = (start_date_iso, selected_date_iso)
+                elif self.period_filter == "Monthly":
+                    start_date_iso = selected_qdate.addDays(-29).toString("yyyy-MM-dd")
+                    where_clause = f"WHERE {normalized_checkin_date_expr} BETWEEN ? AND ?"
+                    params = (start_date_iso, selected_date_iso)
+
                 cur = conn.execute(
-                    """
+                    f"""
                     SELECT id, member_name, member_id, checkin_date, checkin_time, 
                         checkout_time, station, registration_id
                     FROM daily_checkins
-                    WHERE checkin_date = ?
-                    ORDER BY checkin_time DESC
+                    {where_clause}
+                    ORDER BY {normalized_checkin_date_expr} DESC, checkin_time DESC
                     """,
-                    (selected_date,)
+                    params,
                 )
                 all_records = cur.fetchall()
 
@@ -4146,7 +4362,9 @@ class RecordUserPage(QWidget):
                 # ALL and WALKIN: checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id
                 checkin_id, name, member_id, date, checkin_time, checkout_time, station, reg_id = rec
             
-            if search_text and search_text not in (name.lower() + member_id.lower()):
+            searchable_name = (name or "").lower()
+            searchable_member_id = (member_id or "").lower()
+            if search_text and search_text not in (searchable_name + searchable_member_id):
                 continue
             
             filtered_records.append(rec)
