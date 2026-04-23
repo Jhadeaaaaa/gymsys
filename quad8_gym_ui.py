@@ -2,18 +2,19 @@
 import sys
 import math
 import os
-import sqlite3
+import db_connection
+from backend import RegistrationDatabase, _to_qdate, _to_ui_date
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QStackedWidget, QFrame,
     QScrollArea, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
     QComboBox, QDateEdit, QAbstractItemView, QMessageBox, QFileDialog,
-    QSpacerItem
+    QSpacerItem, QTimeEdit
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QDateTime, QDate, QPropertyAnimation,
-    QEasingCurve, QPoint, QRect, pyqtSignal, QSize
+    QEasingCurve, QPoint, QRect, pyqtSignal, QSize, QTime
 )
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPen, QBrush, QLinearGradient,
@@ -21,6 +22,8 @@ from PyQt6.QtGui import (
     QIcon, QPalette, QPdfWriter, QPageSize
 )
 from PyQt6.QtSvg import QSvgRenderer
+
+
 
 # ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
 C = {
@@ -55,518 +58,6 @@ FONT_BODY = "Inter"
 
 def php_currency(amount):
     return f"₱{amount:,.0f}"
-
-
-class RegistrationDatabase:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self._init_db()
-
-    def _build_member_id(self, full_name, phone):
-        initials = "".join(part[0] for part in full_name.upper().split() if part)[:3]
-        if not initials:
-            initials = "NEW"
-        phone_tail = (phone[-4:] if phone and len(phone) >= 4 else "0000")
-        return f"Q8-{initials}-{phone_tail}"
-
-    def _build_walkin_member_id(self, walkin_name):
-        compact = "".join(ch for ch in walkin_name.upper() if ch.isalnum())
-        if not compact:
-            compact = "WALKIN"
-        return f"WALKIN-{compact[:12]}"
-
-    def generate_walkin_member_id(self, walkin_name):
-        return self._build_walkin_member_id(walkin_name)
-
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS member_registrations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    full_name TEXT NOT NULL,
-                    email TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    member_id TEXT,
-                    cycle_start_date TEXT NOT NULL,
-                    cycle_expiration_date TEXT,
-                    protocol_name TEXT NOT NULL,
-                    protocol_price_php REAL NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS daily_checkins (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    registration_id INTEGER,
-                    member_name TEXT NOT NULL,
-                    member_id TEXT NOT NULL,
-                    checkin_date TEXT NOT NULL,
-                    checkin_time TEXT NOT NULL,
-                    checkout_time TEXT,
-                    station TEXT NOT NULL DEFAULT 'STATION 04',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(member_id, checkin_date)
-                )
-                """
-            )
-
-            # Add checkout_time column if it doesn't exist
-            cols = [row[1] for row in conn.execute("PRAGMA table_info(daily_checkins)").fetchall()]
-            if "checkout_time" not in cols:
-                conn.execute("ALTER TABLE daily_checkins ADD COLUMN checkout_time TEXT")
-            
-            # Add cycle_expiration_date column if it doesn't exist
-            member_cols = [row[1] for row in conn.execute("PRAGMA table_info(member_registrations)").fetchall()]
-            if "cycle_expiration_date" not in member_cols:
-                conn.execute("ALTER TABLE member_registrations ADD COLUMN cycle_expiration_date TEXT")
-
-            missing_member_ids = conn.execute(
-                """
-                SELECT id, full_name, phone
-                FROM member_registrations
-                WHERE member_id IS NULL OR TRIM(member_id) = ''
-                """
-            ).fetchall()
-            for rec_id, full_name, phone in missing_member_ids:
-                generated_member_id = self._build_member_id(full_name, phone)
-                conn.execute(
-                    "UPDATE member_registrations SET member_id = ? WHERE id = ?",
-                    (generated_member_id, rec_id),
-                )
-            conn.commit()
-
-    def save_registration(self, payload):
-        from datetime import datetime, timedelta
-        
-        member_id = payload.get("member_id") or self._build_member_id(payload["full_name"], payload["phone"])
-        
-        # Calculate expiration date based on protocol
-        start_date = datetime.strptime(payload["cycle_start_date"], "%m/%d/%Y")
-        protocol = payload["protocol_name"]
-        
-        if protocol == "Weekly":
-            expiration_date = (start_date + timedelta(days=7)).strftime("%m/%d/%Y")
-        elif protocol == "Monthly":
-            # Add 30 days for monthly
-            expiration_date = (start_date + timedelta(days=30)).strftime("%m/%d/%Y")
-        else:
-            expiration_date = payload["cycle_start_date"]  # Default to start date
-        
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO member_registrations (
-                    full_name, email, phone, member_id, cycle_start_date,
-                    cycle_expiration_date, protocol_name, protocol_price_php
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    payload["full_name"],
-                    payload["email"],
-                    payload["phone"],
-                    member_id,
-                    payload["cycle_start_date"],
-                    expiration_date,
-                    payload["protocol_name"],
-                    payload["protocol_price_php"],
-                ),
-            )
-            conn.commit()
-
-    def get_registrations(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT id, full_name, email, phone, member_id, cycle_start_date,
-                    protocol_name, protocol_price_php, created_at
-                FROM member_registrations
-                ORDER BY id DESC
-                """
-            )
-            return cur.fetchall()
-
-    def find_member_for_checkin(self, search_text):
-        token = (search_text or "").strip()
-        if not token:
-            return None
-
-        normalized_member_id = token.upper()
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT id, full_name, email, phone, member_id, cycle_start_date,
-                    protocol_name, protocol_price_php
-                FROM member_registrations
-                WHERE UPPER(member_id) = UPPER(?)
-                OR phone = ?
-                OR full_name LIKE ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (normalized_member_id, token, f"%{token}%"),
-            )
-            row = cur.fetchone()
-
-            if not row:
-                return None
-
-            rec_id, full_name, email, phone, member_id, cycle_start_date, protocol_name, protocol_price_php = row
-            if not member_id:
-                member_id = self._build_member_id(full_name, phone)
-                conn.execute("UPDATE member_registrations SET member_id = ? WHERE id = ?", (member_id, rec_id))
-                conn.commit()
-
-            return {
-                "id": rec_id,
-                "full_name": full_name,
-                "email": email,
-                "phone": phone,
-                "member_id": member_id,
-                "cycle_start_date": cycle_start_date,
-                "protocol_name": protocol_name,
-                "protocol_price_php": protocol_price_php,
-            }
-
-    def record_daily_checkin(self, member, station="STATION 04"):
-        today = QDate.currentDate().toString("yyyy-MM-dd")
-        now_time = QDateTime.currentDateTime().toString("HH:mm:ss")
-
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO daily_checkins (
-                        registration_id, member_name, member_id,
-                        checkin_date, checkin_time, station
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        member["id"],
-                        member["full_name"],
-                        member["member_id"],
-                        today,
-                        now_time,
-                        station,
-                    ),
-                )
-                conn.commit()
-            return True, f"Check-in saved for {today} at {now_time}."
-        except sqlite3.IntegrityError:
-            return False, "Already checked in today."
-
-    def record_walkin_checkin(self, walkin_name, station="STATION 04"):
-        clean_name = " ".join((walkin_name or "").strip().split())
-        if not clean_name:
-            return False, "Walk-in name is required."
-
-        today = QDate.currentDate().toString("yyyy-MM-dd")
-        now_time = QDateTime.currentDateTime().toString("HH:mm:ss")
-        walkin_member_id = self._build_walkin_member_id(clean_name)
-
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO daily_checkins (
-                        registration_id, member_name, member_id,
-                        checkin_date, checkin_time, station
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        None,
-                        clean_name,
-                        walkin_member_id,
-                        today,
-                        now_time,
-                        station,
-                    ),
-                )
-                conn.commit()
-            return True, f"Walk-in check-in saved for {today} at {now_time}.", walkin_member_id
-        except sqlite3.IntegrityError:
-            return False, "This walk-in guest is already checked in today.", walkin_member_id
-
-    def get_existing_walkin_checkin(self, walkin_name, target_date=None):
-        clean_name = " ".join((walkin_name or "").strip().split())
-        if not clean_name:
-            return None
-
-        check_date = target_date or QDate.currentDate().toString("yyyy-MM-dd")
-        normalized_date_expr = """
-            CASE
-                WHEN instr(checkin_date, '/') > 0 THEN
-                    substr(checkin_date, 7, 4) || '-' || substr(checkin_date, 1, 2) || '-' || substr(checkin_date, 4, 2)
-                ELSE
-                    substr(checkin_date, 1, 10)
-            END
-        """
-
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                f"""
-                SELECT id, member_name, member_id, checkin_date, checkin_time, checkout_time, station
-                FROM daily_checkins
-                WHERE registration_id IS NULL
-                AND UPPER(TRIM(member_name)) = UPPER(?)
-                AND {normalized_date_expr} = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (clean_name, check_date),
-            )
-            row = cur.fetchone()
-
-        if not row:
-            return None
-
-        rec_id, member_name, member_id, checkin_date, checkin_time, checkout_time, station = row
-        return {
-            "id": rec_id,
-            "member_name": member_name,
-            "member_id": member_id,
-            "checkin_date": checkin_date,
-            "checkin_time": checkin_time,
-            "checkout_time": checkout_time,
-            "station": station,
-        }
-
-    def record_walkin_checkout(self, checkin_id):
-        now_time = QDateTime.currentDateTime().toString("HH:mm:ss")
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT checkout_time
-                FROM daily_checkins
-                WHERE id = ?
-                LIMIT 1
-                """,
-                (checkin_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return False, "Walk-in check-in record not found.", None
-
-            existing_checkout_time = row[0]
-            if existing_checkout_time:
-                return False, "This walk-in guest is already checked out today.", existing_checkout_time
-
-            conn.execute(
-                """
-                UPDATE daily_checkins
-                SET checkout_time = ?
-                WHERE id = ?
-                """,
-                (now_time, checkin_id),
-            )
-            conn.commit()
-
-        return True, f"Walk-in check-out saved at {now_time}.", now_time
-
-    def get_today_checkins(self):
-        today = QDate.currentDate().toString("yyyy-MM-dd")
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT member_name, member_id, checkin_time
-                FROM daily_checkins
-                WHERE checkin_date = ?
-                ORDER BY checkin_time DESC
-                """,
-                (today,),
-            )
-            return cur.fetchall()
-
-    def get_total_checkins(self):
-        """Get total check-ins across all dates."""
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT COUNT(*) FROM daily_checkins")
-            row = cur.fetchone()
-            return row[0] if row else 0
-
-    def get_checkin_totals_per_date(self, days=5):
-        """Get Weekly+Monthly membership avails per date for the last N calendar dates."""
-        today = QDate.currentDate()
-        start_date = today.addDays(-(days - 1))
-        start_str = start_date.toString("yyyy-MM-dd")
-        end_str = today.toString("yyyy-MM-dd")
-
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT DATE(created_at) AS avail_date, COUNT(*)
-                FROM member_registrations
-                WHERE protocol_name IN ('Weekly', 'Monthly')
-                AND DATE(created_at) BETWEEN ? AND ?
-                GROUP BY DATE(created_at)
-                """,
-                (start_str, end_str),
-            )
-            rows = cur.fetchall()
-
-        count_map = {date_str: count for date_str, count in rows}
-        labels = []
-        values = []
-        for i in range(days):
-            date = start_date.addDays(i)
-            date_str = date.toString("yyyy-MM-dd")
-            labels.append(date.toString("MM/dd"))
-            values.append(count_map.get(date_str, 0))
-
-        # Highlight the most recent date (today) in the five-bar window.
-        return values, labels, days - 1
-
-    def get_checkins_by_date(self, date_str):
-        """Get all check-ins for a specific date"""
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT id, member_name, member_id, checkin_time, station, registration_id
-                FROM daily_checkins
-                WHERE checkin_date = ?
-                ORDER BY checkin_time DESC
-                """,
-                (date_str,),
-            )
-            return cur.fetchall()
-
-    def get_membership_checkins_by_date(self, date_str):
-        """Get check-ins with membership cards (registered members only) for a specific date"""
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT id, member_name, member_id, checkin_time, station, registration_id
-                FROM daily_checkins
-                WHERE checkin_date = ? AND registration_id IS NOT NULL
-                ORDER BY checkin_time DESC
-                """,
-                (date_str,),
-            )
-            return cur.fetchall()
-
-    def get_walkin_checkins_by_date(self, date_str):
-        """Get walk-in check-ins (no membership card) for a specific date"""
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                """
-                SELECT id, member_name, member_id, checkin_time, station, registration_id
-                FROM daily_checkins
-                WHERE checkin_date = ? AND registration_id IS NULL
-                ORDER BY checkin_time DESC
-                """,
-                (date_str,),
-            )
-            return cur.fetchall()
-
-    def get_member_week_checkins(self, member_id):
-        """Get check-in counts for each day of the current week for a specific member"""
-        from datetime import datetime, timedelta
-        
-        today = QDate.currentDate()
-        # Get Monday of current week
-        monday = today.addDays(-(today.dayOfWeek() - 1))
-        
-        counts = []
-        for i in range(7):  # Mon-Sun
-            date = monday.addDays(i)
-            date_str = date.toString("yyyy-MM-dd")
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.execute(
-                    """SELECT COUNT(*) FROM daily_checkins WHERE member_id = ? AND checkin_date = ?""",
-                    (member_id, date_str),
-                )
-                count = cur.fetchone()[0]
-                counts.append(count if count > 0 else 0)
-        
-        return counts
-
-    def get_daily_checkins_past_days(self, days=7):
-        """Get check-in counts for days centered on today (3 before, today, 3 after for days=7)"""
-        today = QDate.currentDate()
-        daily_counts = []
-        daily_dates = []
-        
-        # Calculate how many days before and after today
-        before_days = days // 2
-        after_days = days - before_days - 1
-        
-        # Go backwards from before_days ago to after_days in the future
-        for i in range(-before_days, after_days + 1):
-            date = today.addDays(i)
-            date_str = date.toString("yyyy-MM-dd")
-            
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.execute(
-                    """SELECT COUNT(*) FROM daily_checkins WHERE checkin_date = ?""",
-                    (date_str,),
-                )
-                count = cur.fetchone()[0]
-                daily_counts.append(count)
-                daily_dates.append(date)
-        
-        # today_index is the middle index
-        today_index = before_days
-        return daily_counts, daily_dates, today_index
-
-    def get_daily_checkins_around_date(self, center_date, days=7):
-        """Get check-in counts for days centered on a specific date"""
-        daily_counts = []
-        daily_dates = []
-        
-        # Calculate how many days before and after center date
-        before_days = days // 2
-        after_days = days - before_days - 1
-        
-        # Go backwards from before_days ago to after_days in the future
-        for i in range(-before_days, after_days + 1):
-            date = center_date.addDays(i)
-            date_str = date.toString("yyyy-MM-dd")
-            
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.execute(
-                    """SELECT COUNT(*) FROM daily_checkins WHERE checkin_date = ?""",
-                    (date_str,),
-                )
-                count = cur.fetchone()[0]
-                daily_counts.append(count)
-                daily_dates.append(date)
-        
-        # center_index is the middle index
-        center_index = before_days
-        return daily_counts, daily_dates, center_index
-
-    def get_daily_memberships_around_date(self, center_date, days=7):
-        """Get membership registration counts for days centered on a specific date"""
-        daily_counts = []
-        daily_dates = []
-        
-        # Calculate how many days before and after center date
-        before_days = days // 2
-        after_days = days - before_days - 1
-        
-        # Go backwards from before_days ago to after_days in the future
-        for i in range(-before_days, after_days + 1):
-            date = center_date.addDays(i)
-            date_str = date.toString("yyyy-MM-dd")
-            
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.execute(
-                    """
-                    SELECT COUNT(*) FROM member_registrations 
-                    WHERE DATE(created_at) = ?
-                    """,
-                    (date_str,),
-                )
-                count = cur.fetchone()[0]
-                daily_counts.append(count)
-                daily_dates.append(date)
-        
-        # center_index is the middle index
-        center_index = before_days
-        return daily_counts, daily_dates, center_index
 
 
 # ─── CUSTOM PAINTER WIDGETS ───────────────────────────────────────────────────
@@ -1395,8 +886,7 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT
@@ -1415,10 +905,9 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
             active_weekly = 0
             today = QDate.currentDate()
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT cycle_expiration_date
@@ -1440,10 +929,9 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
             active_monthly = 0
             today = QDate.currentDate()
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT cycle_expiration_date
@@ -1462,7 +950,7 @@ class DashboardPage(QWidget):
 
     def _is_active_membership(self, expiration_date):
         """Use the same ACTIVE rule as Record User membership status."""
-        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        expiry = _to_qdate(expiration_date)
         return expiry.isValid() and QDate.currentDate() <= expiry
 
     def get_active_memberships(self):
@@ -1470,10 +958,9 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
             active_members = 0
             today = QDate.currentDate()
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT cycle_expiration_date
@@ -1493,8 +980,7 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT COALESCE(SUM(protocol_price_php), 0)
@@ -1512,8 +998,7 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT COALESCE(SUM(protocol_price_php), 0)
@@ -1538,9 +1023,8 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
             total = 0.0
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT cycle_start_date, protocol_price_php
@@ -1548,7 +1032,7 @@ class DashboardPage(QWidget):
                     """
                 )
                 for start_date, price in cur.fetchall():
-                    start_qdate = QDate.fromString(start_date or "", "MM/dd/yyyy")
+                    start_qdate = _to_qdate(start_date)
                     if not start_qdate.isValid():
                         continue
                     if start_qdate.year() == year and start_qdate.month() == month:
@@ -1564,10 +1048,9 @@ class DashboardPage(QWidget):
             return 0, 0, 0, 0, "NONE"
 
         try:
-            import sqlite3
             weekly_count = 0
             monthly_count = 0
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT protocol_name, COUNT(*)
@@ -1670,10 +1153,9 @@ class DashboardPage(QWidget):
             return []
 
         try:
-            import sqlite3
             today_iso = QDate.currentDate().toString("yyyy-MM-dd")
             today_us = QDate.currentDate().toString("MM/dd/yyyy")
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 cur = conn.execute(
                     """
                     SELECT member_name, member_id, checkin_date, checkin_time, registration_id
@@ -1734,11 +1216,10 @@ class DashboardPage(QWidget):
         if not self.db:
             return 0
         try:
-            import sqlite3
             from datetime import datetime
             today_iso = datetime.now().strftime("%Y-%m-%d")
             today_us = datetime.now().strftime("%m/%d/%Y")
-            with sqlite3.connect(self.db.db_path) as conn:
+            with db_connection.connect(self.db.db_path) as conn:
                 if period == "Weekly":
                     protocol_filter = "Weekly"
                 elif period == "Monthly":
@@ -2595,7 +2076,7 @@ class RegisterPage(QWidget):
 
         try:
             self.db.save_registration(payload)
-        except sqlite3.Error as exc:
+        except db_connection.Error as exc:
             QMessageBox.critical(self, "Database Error", f"Failed to save registration: {exc}")
             return
 
@@ -3065,7 +2546,7 @@ class QRCheckInPage(QWidget):
 
     def _get_latest_today_member_info(self):
         today = QDate.currentDate().toString("yyyy-MM-dd")
-        with sqlite3.connect(self.db.db_path) as conn:
+        with db_connection.connect(self.db.db_path) as conn:
             cur = conn.execute(
                 """
                 SELECT dc.member_id, mr.protocol_name
@@ -3115,6 +2596,10 @@ class QRCheckInPage(QWidget):
         if not hasattr(self, "qr_frame_lbl"):
             return
 
+        # Keep today's table in sync with latest check-in/check-out updates.
+        if hasattr(self, "today_table"):
+            self.refresh_today_checkins()
+
         token = self.scan_input.text().strip() if hasattr(self, "scan_input") else ""
         if token:
             member = self.db.find_member_for_checkin(token)
@@ -3136,17 +2621,26 @@ class QRCheckInPage(QWidget):
                 if member:
                     self.current_member = member
                     self._populate_member_card(member)
-                    status = "ACTIVE" if self._member_is_active(member) else "EXPIRED"
+                    status = "ACTIVE" if self._member_is_active(member) else "INACTIVE"
                     self.membership_id_preview_lbl.setText(f"Membership ID: {member['member_id']} ({status})")
+                    self.membership_id_preview_lbl.setStyleSheet(
+                        label_style(9, "secondary" if status == "ACTIVE" else "tertiary", "medium", FONT_HEADLINE, 1)
+                    )
+                    self._set_reactivation_controls(member)
         else:
             self._set_checkin_banner_text("CHECK-IN")
             if not self.walkin_input.text().strip():
                 self.membership_id_preview_lbl.setText("Membership ID: --")
                 self.current_member = None
+                self._set_reactivation_controls(None)
                 self._reset_member_card()
 
     def _member_is_active(self, member):
-        start_date = QDate.fromString(member["cycle_start_date"], "MM/dd/yyyy")
+        expiry_from_record = _to_qdate(member.get("cycle_expiration_date"))
+        if expiry_from_record.isValid():
+            return QDate.currentDate() <= expiry_from_record
+
+        start_date = _to_qdate(member.get("cycle_start_date"))
         if not start_date.isValid():
             return True
 
@@ -3192,6 +2686,80 @@ class QRCheckInPage(QWidget):
         self.member_plan_lbl.setText("PLAN: --")
         self.member_start_lbl.setText("START DATE: --")
         self.member_phone_lbl.setText("PHONE: --")
+        self._set_reactivation_controls(None)
+
+    def _set_reactivation_controls(self, member):
+        if not hasattr(self, "membership_status_lbl"):
+            return
+
+        if not member:
+            self.membership_status_lbl.setText("Card Status: --")
+            self.membership_status_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+            self.reactivate_hint_lbl.setVisible(False)
+            self.reactivate_btn.setVisible(False)
+            return
+
+        if self._member_is_active(member):
+            self.membership_status_lbl.setText("Card Status: ACTIVE")
+            self.membership_status_lbl.setStyleSheet(label_style(9, "secondary", "bold", FONT_HEADLINE, 1))
+            self.reactivate_hint_lbl.setText("Existing membership found. Click Activate Membership to renew plan.")
+            self.reactivate_hint_lbl.setStyleSheet(label_style(8, "primary", "medium", FONT_BODY))
+            self.reactivate_hint_lbl.setVisible(True)
+            self.reactivate_btn.setVisible(True)
+        else:
+            self.membership_status_lbl.setText("Card Status: INACTIVE")
+            self.membership_status_lbl.setStyleSheet(label_style(9, "tertiary", "bold", FONT_HEADLINE, 1))
+            self.reactivate_hint_lbl.setText("Inactive card. Click Activate Membership and choose Weekly or Monthly.")
+            self.reactivate_hint_lbl.setStyleSheet(label_style(8, "tertiary", "medium", FONT_BODY))
+            self.reactivate_hint_lbl.setVisible(True)
+            self.reactivate_btn.setVisible(True)
+
+    def _choose_membership_plan_popup(self):
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Activate Membership")
+        dlg.setText("Choose membership plan for activation")
+        weekly_btn = dlg.addButton("Weekly", QMessageBox.ButtonRole.ActionRole)
+        monthly_btn = dlg.addButton("Monthly", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = dlg.addButton(QMessageBox.StandardButton.Cancel)
+        dlg.exec()
+
+        clicked = dlg.clickedButton()
+        if clicked == weekly_btn:
+            return "Weekly"
+        if clicked == monthly_btn:
+            return "Monthly"
+        if clicked == cancel_btn:
+            return None
+        return None
+
+    def _reactivate_membership(self):
+        if not self.current_member or not self.current_member.get("member_id"):
+            QMessageBox.warning(self, "No Member", "Search for a member first before reactivating.")
+            return
+
+        selected_plan = self._choose_membership_plan_popup()
+        if not selected_plan:
+            return
+
+        success, message = self.db.reactivate_membership(
+            self.current_member["member_id"],
+            selected_plan,
+        )
+        if not success:
+            QMessageBox.warning(self, "Reactivation Failed", message)
+            return
+
+        refreshed = self.db.find_member_for_checkin(self.current_member["member_id"])
+        if refreshed:
+            self.current_member = refreshed
+            self._populate_member_card(refreshed)
+            self.membership_id_preview_lbl.setText(f"Membership ID: {refreshed['member_id']} (ACTIVE)")
+            self.membership_id_preview_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_HEADLINE, 1))
+            self._set_reactivation_controls(refreshed)
+
+        self._set_access_style("granted", f"Membership reactivated ({selected_plan})")
+        self.checkin_completed.emit()
+        QMessageBox.information(self, "Membership Reactivated", message)
 
     def _populate_member_card(self, member):
         initials = "".join(part[0] for part in member["full_name"].split() if part)[:2].upper() or "Q8"
@@ -3201,6 +2769,7 @@ class QRCheckInPage(QWidget):
         self.member_plan_lbl.setText(f"PLAN: {member['protocol_name']}")
         self.member_start_lbl.setText(f"START DATE: {member['cycle_start_date']}")
         self.member_phone_lbl.setText(f"PHONE: {member['phone']}")
+        self._set_reactivation_controls(member)
         
         # Update heatmap with actual weekly check-in data
         week_data = self.db.get_member_week_checkins(member['member_id'])
@@ -3222,6 +2791,7 @@ class QRCheckInPage(QWidget):
             self.member_start_lbl.setText(f"CHECK-IN DATE: {QDate.currentDate().toString('MM/dd/yyyy')}")
 
         self.member_phone_lbl.setText(f"CHECK-OUT TIME: {checkout_time or '--'}")
+        self._set_reactivation_controls(None)
 
     def _update_walkin_id_preview(self, text):
         clean_name = " ".join((text or "").strip().split())
@@ -3236,6 +2806,7 @@ class QRCheckInPage(QWidget):
         if not clean_name:
             self.walkin_existing_lbl.setText("Existing today: --")
             self.walkin_existing_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+            self._set_checkout_input_now()
             if not self.scan_input.text().strip():
                 self._reset_member_card()
             self._update_checkin_banner_live()
@@ -3245,6 +2816,7 @@ class QRCheckInPage(QWidget):
         if not existing:
             self.walkin_existing_lbl.setText("Existing today: none")
             self.walkin_existing_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+            self._set_checkout_input_now()
             return
 
         checkin_time = existing.get("checkin_time") or "--"
@@ -3252,9 +2824,11 @@ class QRCheckInPage(QWidget):
         if checkout_time:
             self.walkin_existing_lbl.setText(f"Existing today: IN {checkin_time} | OUT {checkout_time}")
             self.walkin_existing_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+            self._set_checkout_input_from_24h(checkout_time)
         else:
             self.walkin_existing_lbl.setText(f"Existing today: IN {checkin_time} | save to set OUT")
             self.walkin_existing_lbl.setStyleSheet(label_style(9, "tertiary", "medium", FONT_BODY))
+            self._set_checkout_input_now()
 
         self._populate_walkin_card(
             existing["member_name"],
@@ -3268,11 +2842,53 @@ class QRCheckInPage(QWidget):
         self._update_walkin_id_preview(text)
         self._update_existing_walkin_preview(text)
 
+    def _set_checkout_input_now(self):
+        if not hasattr(self, "walkin_checkout_time_edit") or not hasattr(self, "walkin_checkout_ampm_combo"):
+            return
+        now_time = QTime.currentTime()
+        meridiem = "AM" if now_time.hour() < 12 else "PM"
+        hour_12 = now_time.hour() % 12
+        if hour_12 == 0:
+            hour_12 = 12
+        self.walkin_checkout_time_edit.setTime(QTime(hour_12, now_time.minute(), 0))
+        self.walkin_checkout_ampm_combo.setCurrentText(meridiem)
+
+    def _set_checkout_input_from_24h(self, checkout_time):
+        if not hasattr(self, "walkin_checkout_time_edit") or not hasattr(self, "walkin_checkout_ampm_combo"):
+            return
+
+        parsed_time = QTime.fromString(checkout_time or "", "HH:mm:ss")
+        if not parsed_time.isValid():
+            parsed_time = QTime.fromString(checkout_time or "", "HH:mm")
+        if not parsed_time.isValid():
+            self._set_checkout_input_now()
+            return
+
+        meridiem = "AM" if parsed_time.hour() < 12 else "PM"
+        hour_12 = parsed_time.hour() % 12
+        if hour_12 == 0:
+            hour_12 = 12
+        self.walkin_checkout_time_edit.setTime(QTime(hour_12, parsed_time.minute(), 0))
+        self.walkin_checkout_ampm_combo.setCurrentText(meridiem)
+
+    def _get_checkout_time_input(self):
+        if not hasattr(self, "walkin_checkout_time_edit") or not hasattr(self, "walkin_checkout_ampm_combo"):
+            return True, None
+
+        raw_time = self.walkin_checkout_time_edit.time().toString("hh:mm")
+        meridiem = self.walkin_checkout_ampm_combo.currentText().strip().upper()
+        parsed_time = QTime.fromString(f"{raw_time} {meridiem}", "hh:mm AP")
+        if not parsed_time.isValid():
+            return False, None
+        return True, parsed_time.toString("HH:mm:ss")
+
     def _update_membership_id_preview(self, text):
         token = (text or "").strip()
         if not token:
             self.membership_id_preview_lbl.setText("Membership ID: --")
+            self.membership_id_preview_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_HEADLINE, 1))
             self.current_member = None
+            self._set_reactivation_controls(None)
             if not self.walkin_input.text().strip():
                 self._reset_member_card()
             self._update_checkin_banner_live()
@@ -3281,7 +2897,9 @@ class QRCheckInPage(QWidget):
         member = self.db.find_member_for_checkin(token)
         if not member:
             self.membership_id_preview_lbl.setText("Membership ID: Not found")
+            self.membership_id_preview_lbl.setStyleSheet(label_style(9, "tertiary", "medium", FONT_HEADLINE, 1))
             self.current_member = None
+            self._set_reactivation_controls(None)
             if not self.walkin_input.text().strip():
                 self._reset_member_card()
             self._update_checkin_banner_live()
@@ -3289,8 +2907,12 @@ class QRCheckInPage(QWidget):
 
         self.current_member = member
         self._populate_member_card(member)
-        status = "ACTIVE" if self._member_is_active(member) else "EXPIRED"
+        status = "ACTIVE" if self._member_is_active(member) else "INACTIVE"
         self.membership_id_preview_lbl.setText(f"Membership ID: {member['member_id']} ({status})")
+        self.membership_id_preview_lbl.setStyleSheet(
+            label_style(9, "secondary" if status == "ACTIVE" else "tertiary", "medium", FONT_HEADLINE, 1)
+        )
+        self._set_reactivation_controls(member)
         self._update_checkin_banner_live()
 
     def _on_checkin_banner_clicked(self, event):
@@ -3314,6 +2936,11 @@ class QRCheckInPage(QWidget):
             QMessageBox.warning(self, "Missing Name", "Enter walk-in name for non-member check-in.")
             return
 
+        valid_time, manual_checkout_time = self._get_checkout_time_input()
+        if not valid_time:
+            QMessageBox.warning(self, "Invalid Time", "Set checkout time using hh:mm and AM/PM.")
+            return
+
         existing = self.db.get_existing_walkin_checkin(clean_name)
         if existing:
             existing_checkout_time = existing.get("checkout_time")
@@ -3334,7 +2961,7 @@ class QRCheckInPage(QWidget):
                 self.refresh_today_checkins()
                 return
 
-            success, message, checkout_time = self.db.record_walkin_checkout(existing["id"])
+            success, message, checkout_time = self.db.record_walkin_checkout(existing["id"], manual_checkout_time)
             if success:
                 self._populate_walkin_card(
                     existing["member_name"],
@@ -3347,6 +2974,7 @@ class QRCheckInPage(QWidget):
                 QMessageBox.information(self, "Walk-In Checked-Out", message)
                 self.refresh_today_checkins()
                 self.walkin_input.clear()
+                self._set_checkout_input_now()
                 self.scan_input.clear()
                 self._update_walkin_id_preview("")
                 self._update_existing_walkin_preview("")
@@ -3367,6 +2995,7 @@ class QRCheckInPage(QWidget):
             QMessageBox.information(self, "Walk-In Saved", message)
             self.refresh_today_checkins()
             self.walkin_input.clear()
+            self._set_checkout_input_now()
             self.scan_input.clear()
             self._update_walkin_id_preview("")
             self._update_existing_walkin_preview("")
@@ -3379,6 +3008,58 @@ class QRCheckInPage(QWidget):
         self._set_access_style("already", "Walk-in already checked in today")
         QMessageBox.information(self, "Already Checked-In", message)
         self.refresh_today_checkins()
+
+    def _set_walkin_checkout_time(self):
+        clean_name = " ".join((self.walkin_input.text() or "").strip().split())
+        if not clean_name:
+            QMessageBox.warning(self, "Missing Name", "Enter walk-in name before setting checkout time.")
+            return
+
+        valid_time, manual_checkout_time = self._get_checkout_time_input()
+        if not valid_time:
+            QMessageBox.warning(self, "Invalid Time", "Set checkout time using hh:mm and AM/PM.")
+            return
+
+        existing = self.db.get_existing_walkin_checkin(clean_name)
+        if not existing:
+            QMessageBox.information(self, "No Check-In Found", "No existing walk-in check-in found for this name today.")
+            return
+
+        if existing.get("checkout_time"):
+            self._populate_walkin_card(
+                existing["member_name"],
+                existing["member_id"],
+                existing.get("checkin_date"),
+                existing.get("checkin_time"),
+                existing.get("checkout_time"),
+            )
+            self._set_access_style("already", "Walk-in already checked out today")
+            QMessageBox.information(self, "Already Checked-Out", f"Checkout already set at {existing.get('checkout_time')}.")
+            self.refresh_today_checkins()
+            return
+
+        success, message, checkout_time = self.db.record_walkin_checkout(existing["id"], manual_checkout_time)
+        if not success:
+            self._set_access_style("already", "Walk-in checkout unavailable")
+            QMessageBox.information(self, "Walk-In Checkout", message)
+            self.refresh_today_checkins()
+            return
+
+        self._populate_walkin_card(
+            existing["member_name"],
+            existing["member_id"],
+            existing.get("checkin_date"),
+            existing.get("checkin_time"),
+            checkout_time,
+        )
+        self._set_access_style("granted", "Walk-in checkout time set")
+        self.walkin_input.clear()
+        self._set_checkout_input_now()
+        self._update_walkin_id_preview("")
+        self._update_existing_walkin_preview("")
+        self.refresh_today_checkins()
+        self.checkin_completed.emit()
+        QMessageBox.information(self, "Checkout Time Set", message)
 
     def _handle_check_in(self):
         token = self.scan_input.text().strip()
@@ -3409,8 +3090,9 @@ class QRCheckInPage(QWidget):
             if walkin_name:
                 self._save_walkin_checkin(walkin_name)
                 return
-            self._set_access_style("denied", "Membership expired")
-            QMessageBox.warning(self, "Membership Expired", "Membership is not active. Use walk-in name for today-only check-in.")
+            self._set_access_style("denied", "Membership inactive")
+            self._set_reactivation_controls(member)
+            QMessageBox.warning(self, "Membership Inactive", "Membership is inactive. Click Activate Membership and choose Weekly or Monthly.")
             return
 
         success, message = self.db.record_daily_checkin(member)
@@ -3435,7 +3117,8 @@ class QRCheckInPage(QWidget):
         self.today_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             for c, value in enumerate(row):
-                self.today_table.setItem(r, c, QTableWidgetItem(value))
+                display_value = value if value else "--"
+                self.today_table.setItem(r, c, QTableWidgetItem(str(display_value)))
 
     def _build(self):
         lay = QHBoxLayout(self)
@@ -3520,7 +3203,7 @@ class QRCheckInPage(QWidget):
         input_title = QLabel("MEMBER LOOKUP")
         input_title.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
         self.scan_input = QLineEdit()
-        self.scan_input.setPlaceholderText("Member ID / Phone / Name (for active members)")
+        self.scan_input.setPlaceholderText("Member ID / Phone / Name")
         self.scan_input.setFixedHeight(40)
         self.scan_input.setStyleSheet(input_style())
         self.scan_input.returnPressed.connect(self._handle_check_in)
@@ -3529,9 +3212,31 @@ class QRCheckInPage(QWidget):
         self.membership_id_preview_lbl = QLabel("Membership ID: --")
         self.membership_id_preview_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_HEADLINE, 1))
 
+        self.membership_status_lbl = QLabel("Card Status: --")
+        self.membership_status_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+
+        self.reactivate_hint_lbl = QLabel("Inactive card. Click Activate Membership and choose plan.")
+        self.reactivate_hint_lbl.setStyleSheet(label_style(8, "tertiary", "medium", FONT_BODY))
+        self.reactivate_hint_lbl.setVisible(False)
+
+        reactivate_row = QHBoxLayout()
+        reactivate_row.setSpacing(8)
+
+        self.reactivate_btn = QPushButton("ACTIVATE MEMBERSHIP")
+        self.reactivate_btn.setFixedHeight(30)
+        self.reactivate_btn.setStyleSheet(btn_secondary_style())
+        self.reactivate_btn.clicked.connect(self._reactivate_membership)
+        self.reactivate_btn.setVisible(False)
+
+        reactivate_row.addWidget(self.reactivate_btn)
+        reactivate_row.addStretch()
+
         lookup_lay.addWidget(input_title)
         lookup_lay.addWidget(self.scan_input)
         lookup_lay.addWidget(self.membership_id_preview_lbl)
+        lookup_lay.addWidget(self.membership_status_lbl)
+        lookup_lay.addWidget(self.reactivate_hint_lbl)
+        lookup_lay.addLayout(reactivate_row)
 
         walkin_title = QLabel("WALK-IN NAME (NO MEMBERSHIP)")
         walkin_title.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
@@ -3718,9 +3423,74 @@ class QRCheckInPage(QWidget):
         self.member_start_lbl.setStyleSheet(label_style(9, "on_surface", "medium"))
         self.member_phone_lbl = QLabel("PHONE: --")
         self.member_phone_lbl.setStyleSheet(label_style(9, "on_surface", "medium"))
+        checkout_row = QHBoxLayout()
+        checkout_row.setSpacing(8)
+        checkout_lbl = QLabel("CHECK-OUT TIME:")
+        checkout_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_HEADLINE, 1))
+        self.walkin_checkout_time_edit = QTimeEdit()
+        self.walkin_checkout_time_edit.setDisplayFormat("hh:mm")
+        self.walkin_checkout_time_edit.setTime(QTime.currentTime())
+        self.walkin_checkout_time_edit.setFixedHeight(30)
+        self.walkin_checkout_time_edit.setStyleSheet(f"""
+            QTimeEdit {{
+                background: {C['surface_container_lowest']};
+                color: {C['on_surface']};
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                min-width: 110px;
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+            }}
+            QTimeEdit::up-button, QTimeEdit::down-button {{
+                width: 14px;
+                background: transparent;
+                border: none;
+            }}
+        """)
+        self.walkin_checkout_ampm_combo = QComboBox()
+        self.walkin_checkout_ampm_combo.addItems(["AM", "PM"])
+        self.walkin_checkout_ampm_combo.setCurrentText("AM" if QTime.currentTime().hour() < 12 else "PM")
+        self.walkin_checkout_ampm_combo.setFixedHeight(30)
+        self.walkin_checkout_ampm_combo.setFixedWidth(70)
+        self.walkin_checkout_ampm_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C['surface_container_lowest']};
+                color: {C['on_surface']};
+                border: 1px solid {C['outline_variant']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-family: '{FONT_BODY}';
+                font-size: 10px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 18px;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border: none;
+            }}
+            QAbstractItemView {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                border: 1px solid {C['outline_variant']};
+            }}
+        """)
+        self.set_checkout_btn = QPushButton("SET CHECKOUT TIME")
+        self.set_checkout_btn.setFixedHeight(30)
+        self.set_checkout_btn.setStyleSheet(btn_secondary_style())
+        self.set_checkout_btn.clicked.connect(self._set_walkin_checkout_time)
+        checkout_row.addWidget(checkout_lbl)
+        checkout_row.addWidget(self.walkin_checkout_time_edit)
+        checkout_row.addWidget(self.walkin_checkout_ampm_combo)
+        checkout_row.addWidget(self.set_checkout_btn)
+        checkout_row.addStretch()
         plan_lay.addWidget(self.member_plan_lbl)
         plan_lay.addWidget(self.member_start_lbl)
         plan_lay.addWidget(self.member_phone_lbl)
+        plan_lay.addLayout(checkout_row)
 
         member_lay.addWidget(plan_card)
         right.addWidget(member_card)
@@ -3742,11 +3512,12 @@ class QRCheckInPage(QWidget):
         logs_lay.addLayout(logs_head)
 
         self.today_table = QTableWidget()
-        self.today_table.setColumnCount(3)
-        self.today_table.setHorizontalHeaderLabels(["Member", "Member ID", "Time"])
+        self.today_table.setColumnCount(4)
+        self.today_table.setHorizontalHeaderLabels(["Member", "Member ID", "Check-in", "Check-out"])
         self.today_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.today_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.today_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.today_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.today_table.verticalHeader().setVisible(False)
         self.today_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.today_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -3772,6 +3543,286 @@ class QRCheckInPage(QWidget):
         right.addStretch()
 
         lay.addLayout(right, 2)
+
+
+# ─── PAGE: SALES ─────────────────────────────────────────────────────────────
+
+class SalesPage(QWidget):
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.product_id_by_label = {}
+        self.setStyleSheet(f"background: {C['background']};")
+        self._build()
+        self.refresh_data()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(14)
+
+        header = QLabel("Sales Operations")
+        header.setStyleSheet(label_style(24, "on_surface", "bold", FONT_HEADLINE))
+        sub = QLabel("Record Sales, Product Inventory, and Sales Report")
+        sub.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_BODY))
+        lay.addWidget(header)
+        lay.addWidget(sub)
+
+        summary_card = QFrame()
+        summary_card.setStyleSheet(card_style("surface_container"))
+        summary_lay = QHBoxLayout(summary_card)
+        summary_lay.setContentsMargins(14, 12, 14, 12)
+        summary_lay.setSpacing(12)
+
+        self.today_sales_lbl = QLabel("TODAY SALES: ₱0")
+        self.today_sales_lbl.setStyleSheet(label_style(11, "secondary", "bold", FONT_HEADLINE, 1))
+        self.total_sales_lbl = QLabel("TOTAL SALES: ₱0")
+        self.total_sales_lbl.setStyleSheet(label_style(11, "primary", "bold", FONT_HEADLINE, 1))
+        self.total_txn_lbl = QLabel("TRANSACTIONS: 0")
+        self.total_txn_lbl.setStyleSheet(label_style(11, "on_surface", "medium", FONT_BODY))
+
+        summary_lay.addWidget(self.today_sales_lbl)
+        summary_lay.addStretch()
+        summary_lay.addWidget(self.total_sales_lbl)
+        summary_lay.addStretch()
+        summary_lay.addWidget(self.total_txn_lbl)
+        lay.addWidget(summary_card)
+
+        sales_card = QFrame()
+        sales_card.setStyleSheet(card_style("surface_container"))
+        sales_lay = QVBoxLayout(sales_card)
+        sales_lay.setContentsMargins(14, 12, 14, 12)
+        sales_lay.setSpacing(8)
+
+        sales_title = QLabel("Record Sales")
+        sales_title.setStyleSheet(label_style(11, "on_surface", "bold", FONT_HEADLINE, 1))
+        sales_lay.addWidget(sales_title)
+
+        sales_form = QHBoxLayout()
+        sales_form.setSpacing(8)
+
+        self.sales_product_combo = QComboBox()
+        self.sales_product_combo.setStyleSheet(input_style())
+        self.sales_product_combo.setMinimumWidth(280)
+
+        self.sales_qty_input = QLineEdit()
+        self.sales_qty_input.setPlaceholderText("Quantity")
+        self.sales_qty_input.setFixedHeight(36)
+        self.sales_qty_input.setStyleSheet(input_style())
+
+        self.record_sale_btn = QPushButton("RECORD SALE")
+        self.record_sale_btn.setFixedHeight(36)
+        self.record_sale_btn.setStyleSheet(btn_primary_style())
+        self.record_sale_btn.clicked.connect(self._record_sale)
+
+        sales_form.addWidget(self.sales_product_combo, 4)
+        sales_form.addWidget(self.sales_qty_input, 1)
+        sales_form.addWidget(self.record_sale_btn, 1)
+        sales_lay.addLayout(sales_form)
+
+        self.sales_status_lbl = QLabel("Ready")
+        self.sales_status_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+        sales_lay.addWidget(self.sales_status_lbl)
+
+        lay.addWidget(sales_card)
+
+        inventory_card = QFrame()
+        inventory_card.setStyleSheet(card_style("surface_container"))
+        inventory_lay = QVBoxLayout(inventory_card)
+        inventory_lay.setContentsMargins(14, 12, 14, 12)
+        inventory_lay.setSpacing(8)
+
+        inventory_title = QLabel("Product Inventory")
+        inventory_title.setStyleSheet(label_style(11, "on_surface", "bold", FONT_HEADLINE, 1))
+        inventory_lay.addWidget(inventory_title)
+
+        inventory_form = QHBoxLayout()
+        inventory_form.setSpacing(8)
+
+        self.inv_name_input = QLineEdit()
+        self.inv_name_input.setPlaceholderText("Product Name")
+        self.inv_name_input.setFixedHeight(34)
+        self.inv_name_input.setStyleSheet(input_style())
+
+        self.inv_sku_input = QLineEdit()
+        self.inv_sku_input.setPlaceholderText("SKU")
+        self.inv_sku_input.setFixedHeight(34)
+        self.inv_sku_input.setStyleSheet(input_style())
+
+        self.inv_price_input = QLineEdit()
+        self.inv_price_input.setPlaceholderText("Unit Price")
+        self.inv_price_input.setFixedHeight(34)
+        self.inv_price_input.setStyleSheet(input_style())
+
+        self.inv_qty_input = QLineEdit()
+        self.inv_qty_input.setPlaceholderText("Stock Qty")
+        self.inv_qty_input.setFixedHeight(34)
+        self.inv_qty_input.setStyleSheet(input_style())
+
+        self.save_product_btn = QPushButton("SAVE PRODUCT")
+        self.save_product_btn.setFixedHeight(34)
+        self.save_product_btn.setStyleSheet(btn_secondary_style())
+        self.save_product_btn.clicked.connect(self._save_product)
+
+        inventory_form.addWidget(self.inv_name_input, 3)
+        inventory_form.addWidget(self.inv_sku_input, 2)
+        inventory_form.addWidget(self.inv_price_input, 1)
+        inventory_form.addWidget(self.inv_qty_input, 1)
+        inventory_form.addWidget(self.save_product_btn, 1)
+        inventory_lay.addLayout(inventory_form)
+
+        self.inventory_status_lbl = QLabel("No inventory changes yet")
+        self.inventory_status_lbl.setStyleSheet(label_style(9, "on_surface_variant", "medium", FONT_BODY))
+        inventory_lay.addWidget(self.inventory_status_lbl)
+
+        self.inventory_table = QTableWidget()
+        self.inventory_table.setColumnCount(5)
+        self.inventory_table.setHorizontalHeaderLabels(["Product", "SKU", "Unit Price", "Stock", "Updated"])
+        self.inventory_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.inventory_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.inventory_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.inventory_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.inventory_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.inventory_table.verticalHeader().setVisible(False)
+        self.inventory_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.inventory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.inventory_table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {C['surface_container_low']};
+                color: {C['on_surface']};
+                border: 1px solid {C['outline_variant']}66;
+                border-radius: 6px;
+                gridline-color: {C['outline_variant']}33;
+            }}
+            QHeaderView::section {{
+                background: {C['surface_container_high']};
+                color: {C['on_surface_variant']};
+                border: none;
+                padding: 6px;
+                font-size: 9px;
+                font-weight: 700;
+            }}
+        """)
+        inventory_lay.addWidget(self.inventory_table)
+        lay.addWidget(inventory_card)
+
+        report_card = QFrame()
+        report_card.setStyleSheet(card_style("surface_container"))
+        report_lay = QVBoxLayout(report_card)
+        report_lay.setContentsMargins(14, 12, 14, 12)
+        report_lay.setSpacing(8)
+
+        report_head = QHBoxLayout()
+        report_title = QLabel("Sales Report")
+        report_title.setStyleSheet(label_style(11, "on_surface", "bold", FONT_HEADLINE, 1))
+        refresh_btn = QPushButton("REFRESH")
+        refresh_btn.setFixedHeight(30)
+        refresh_btn.setStyleSheet(btn_secondary_style())
+        refresh_btn.clicked.connect(self.refresh_data)
+        report_head.addWidget(report_title)
+        report_head.addStretch()
+        report_head.addWidget(refresh_btn)
+        report_lay.addLayout(report_head)
+
+        self.sales_table = QTableWidget()
+        self.sales_table.setColumnCount(7)
+        self.sales_table.setHorizontalHeaderLabels(["Sale Ref", "Sold At", "Product", "SKU", "Qty", "Unit", "Total"])
+        self.sales_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.sales_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.sales_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.sales_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.sales_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.sales_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.sales_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.sales_table.verticalHeader().setVisible(False)
+        self.sales_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.sales_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sales_table.setStyleSheet(self.inventory_table.styleSheet())
+        report_lay.addWidget(self.sales_table)
+        lay.addWidget(report_card)
+
+    def _save_product(self):
+        success, message = self.db.add_or_update_product(
+            self.inv_name_input.text(),
+            self.inv_sku_input.text(),
+            self.inv_price_input.text(),
+            self.inv_qty_input.text(),
+        )
+        if success:
+            self.inventory_status_lbl.setText(message)
+            self.inventory_status_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+            self.inv_name_input.clear()
+            self.inv_sku_input.clear()
+            self.inv_price_input.clear()
+            self.inv_qty_input.clear()
+            self.refresh_data()
+            return
+
+        self.inventory_status_lbl.setText(message)
+        self.inventory_status_lbl.setStyleSheet(label_style(9, "tertiary", "medium", FONT_BODY))
+
+    def _record_sale(self):
+        product_id = self.sales_product_combo.currentData()
+        qty_text = (self.sales_qty_input.text() or "").strip()
+
+        success, message = self.db.record_sale(product_id, qty_text)
+        if success:
+            self.sales_status_lbl.setText(message)
+            self.sales_status_lbl.setStyleSheet(label_style(9, "secondary", "medium", FONT_BODY))
+            self.sales_qty_input.clear()
+            self.refresh_data()
+            return
+
+        self.sales_status_lbl.setText(message)
+        self.sales_status_lbl.setStyleSheet(label_style(9, "tertiary", "medium", FONT_BODY))
+
+    def _refresh_saleable_products(self):
+        products = self.db.get_saleable_products()
+        self.sales_product_combo.clear()
+        for pid, name, sku, price, qty in products:
+            self.sales_product_combo.addItem(f"{name} [{sku}]  {php_currency(float(price))}  (Stock {qty})", pid)
+
+    def _refresh_inventory_table(self):
+        rows = self.db.get_inventory_products()
+        self.inventory_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            _, product_name, sku, unit_price, stock, updated_at = row
+            values = [
+                product_name,
+                sku,
+                php_currency(float(unit_price or 0)),
+                str(stock),
+                str(updated_at),
+            ]
+            for c, value in enumerate(values):
+                self.inventory_table.setItem(r, c, QTableWidgetItem(str(value)))
+
+    def _refresh_sales_report(self):
+        summary = self.db.get_sales_summary()
+        self.today_sales_lbl.setText(f"TODAY SALES: {php_currency(summary['today_sales_php'])}")
+        self.total_sales_lbl.setText(f"TOTAL SALES: {php_currency(summary['overall_sales_php'])}")
+        self.total_txn_lbl.setText(f"TRANSACTIONS: {summary['overall_transactions']}")
+
+        rows = self.db.get_sales_records(200)
+        self.sales_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            sale_ref, sold_at, product_name, sku, qty, unit_price, total_price = row
+            values = [
+                sale_ref,
+                str(sold_at),
+                product_name,
+                sku,
+                str(qty),
+                php_currency(float(unit_price or 0)),
+                php_currency(float(total_price or 0)),
+            ]
+            for c, value in enumerate(values):
+                self.sales_table.setItem(r, c, QTableWidgetItem(str(value)))
+
+    def refresh_data(self):
+        self._refresh_saleable_products()
+        self._refresh_inventory_table()
+        self._refresh_sales_report()
 
 
 # ─── PAGE: REPORTS ────────────────────────────────────────────────────────────
@@ -4439,7 +4490,7 @@ class RecordUserPage(QWidget):
         self.refresh_records()
 
     def _membership_status(self, expiration_date):
-        expiry = QDate.fromString(expiration_date or "", "MM/dd/yyyy")
+        expiry = _to_qdate(expiration_date)
         if not expiry.isValid():
             return "INACTIVE"
         return "ACTIVE" if QDate.currentDate() <= expiry else "INACTIVE"
@@ -4462,7 +4513,7 @@ class RecordUserPage(QWidget):
             END
         """
 
-        with sqlite3.connect(self.db.db_path) as conn:
+        with db_connection.connect(self.db.db_path) as conn:
             if self.current_filter == "MEMBERSHIP":
                 # Show registered members; separate Weekly and Monthly plans.
                 if self.period_filter == "Weekly":
@@ -4565,8 +4616,8 @@ class RecordUserPage(QWidget):
                 values = [
                     name,
                     member_id or "--",
-                    start_date or "--",
-                    expiration_date or "--",
+                    _to_ui_date(start_date) or "--",
+                    _to_ui_date(expiration_date) or "--",
                     status,
                 ]
             else:
@@ -4610,8 +4661,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.setStyleSheet(f"QMainWindow {{ background: {C['background']}; }}")
 
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gymsys.db")
-        self.db = RegistrationDatabase(db_path)
+        self.db = RegistrationDatabase()
 
         # Central stack: login vs app
         self.root_stack = QStackedWidget()
