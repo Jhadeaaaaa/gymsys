@@ -349,6 +349,44 @@ def nav_btn_style(active=False):
     """
 
 
+def nav_sub_btn_style(active=False):
+    if active:
+        return f"""
+            QPushButton {{
+                background: {C['surface_container_high']};
+                color: {C['primary']};
+                font-family: '{FONT_HEADLINE}';
+                font-size: 8px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                border: none;
+                border-left: 2px solid {C['primary']};
+                border-radius: 0px;
+                padding: 10px 16px 10px 40px;
+                text-align: left;
+            }}
+        """
+    return f"""
+        QPushButton {{
+            background: transparent;
+            color: {C['on_surface_variant']};
+            font-family: '{FONT_HEADLINE}';
+            font-size: 8px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            border: none;
+            border-left: 2px solid transparent;
+            border-radius: 0px;
+            padding: 10px 16px 10px 40px;
+            text-align: left;
+        }}
+        QPushButton:hover {{
+            background: {C['surface_container']};
+            color: {C['on_surface']};
+        }}
+    """
+
+
 # ─── SIDEBAR ──────────────────────────────────────────────────────────────────
 
 class Sidebar(QWidget):
@@ -360,7 +398,14 @@ class Sidebar(QWidget):
         ("◈", "RECORD USER", 1),
         ("◉", "REGISTER MEMBER", 2),
         ("⊡", "CHECK-IN", 3),
-        ("▦", "REPORTS", 4),
+        ("▦", "SALES", 4),
+    ]
+
+    SALES_ROUTE_IDXS = {4, 5, 6}
+    SALES_SUB_ITEMS = [
+        ("ADDING SALES", 4),
+        ("SALES INVENTORY", 5),
+        ("SALES REPORT", 6),
     ]
 
     def __init__(self, parent=None):
@@ -368,6 +413,7 @@ class Sidebar(QWidget):
         self.setFixedWidth(220)
         self.setStyleSheet(f"background: {C['surface_container_low']}; border: none;")
         self.current = 0
+        self.current_page = 0
         self._build()
 
     def _build(self):
@@ -400,6 +446,8 @@ class Sidebar(QWidget):
 
         # Nav buttons
         self.nav_btns = []
+        self._sales_sub_btns = []
+        self.sales_sub_container = None
         for icon, label, idx in self.NAV_ITEMS:
             btn = QPushButton(f"  {icon}   {label}")
             btn.setFixedHeight(44)
@@ -407,6 +455,23 @@ class Sidebar(QWidget):
             btn.clicked.connect(lambda _, i=idx: self._nav(i))
             layout.addWidget(btn)
             self.nav_btns.append(btn)
+
+            if idx == 4:
+                self.sales_sub_container = QWidget()
+                sub_lay = QVBoxLayout(self.sales_sub_container)
+                sub_lay.setContentsMargins(0, 0, 0, 0)
+                sub_lay.setSpacing(0)
+
+                for sub_label, sub_idx in self.SALES_SUB_ITEMS:
+                    sub_btn = QPushButton(sub_label)
+                    sub_btn.setFixedHeight(36)
+                    sub_btn.setStyleSheet(nav_sub_btn_style(False))
+                    sub_btn.clicked.connect(lambda _, i=sub_idx: self._nav(i))
+                    sub_lay.addWidget(sub_btn)
+                    self._sales_sub_btns.append((sub_idx, sub_btn))
+
+                self.sales_sub_container.setVisible(False)
+                layout.addWidget(self.sales_sub_container)
 
         layout.addStretch()
 
@@ -462,9 +527,18 @@ class Sidebar(QWidget):
             self.logout_requested.emit()
 
     def _nav(self, idx):
-        self.current = idx
+        self.current_page = idx
+        self.current = 4 if idx in self.SALES_ROUTE_IDXS else idx
+
         for i, btn in enumerate(self.nav_btns):
-            btn.setStyleSheet(nav_btn_style(i == idx))
+            btn.setStyleSheet(nav_btn_style(i == self.current))
+
+        if self.sales_sub_container is not None:
+            self.sales_sub_container.setVisible(self.current == 4)
+
+        for sub_idx, sub_btn in self._sales_sub_btns:
+            sub_btn.setStyleSheet(nav_sub_btn_style(sub_idx == idx))
+
         self.nav_changed.emit(idx)
 
     def set_active(self, idx):
@@ -3548,9 +3622,10 @@ class QRCheckInPage(QWidget):
 # ─── PAGE: SALES ─────────────────────────────────────────────────────────────
 
 class SalesPage(QWidget):
-    def __init__(self, db, parent=None):
+    def __init__(self, db, mode="all", parent=None):
         super().__init__(parent)
         self.db = db
+        self.mode = (mode or "all").strip().lower()
         self.product_id_by_label = {}
         self.setStyleSheet(f"background: {C['background']};")
         self._build()
@@ -3563,7 +3638,14 @@ class SalesPage(QWidget):
 
         header = QLabel("Sales Operations")
         header.setStyleSheet(label_style(24, "on_surface", "bold", FONT_HEADLINE))
-        sub = QLabel("Record Sales, Product Inventory, and Sales Report")
+        sub_text = "Adding Sales, Sales Inventory, and Sales Report"
+        if self.mode == "add":
+            sub_text = "Adding Sales"
+        elif self.mode == "inventory":
+            sub_text = "Sales Inventory"
+        elif self.mode == "report":
+            sub_text = "Sales Report"
+        sub = QLabel(sub_text)
         sub.setStyleSheet(label_style(10, "on_surface_variant", "medium", FONT_BODY))
         lay.addWidget(header)
         lay.addWidget(sub)
@@ -3589,12 +3671,13 @@ class SalesPage(QWidget):
         lay.addWidget(summary_card)
 
         sales_card = QFrame()
+        self.sales_card = sales_card
         sales_card.setStyleSheet(card_style("surface_container"))
         sales_lay = QVBoxLayout(sales_card)
         sales_lay.setContentsMargins(14, 12, 14, 12)
         sales_lay.setSpacing(8)
 
-        sales_title = QLabel("Record Sales")
+        sales_title = QLabel("Adding Sales")
         sales_title.setStyleSheet(label_style(11, "on_surface", "bold", FONT_HEADLINE, 1))
         sales_lay.addWidget(sales_title)
 
@@ -3627,12 +3710,13 @@ class SalesPage(QWidget):
         lay.addWidget(sales_card)
 
         inventory_card = QFrame()
+        self.inventory_card = inventory_card
         inventory_card.setStyleSheet(card_style("surface_container"))
         inventory_lay = QVBoxLayout(inventory_card)
         inventory_lay.setContentsMargins(14, 12, 14, 12)
         inventory_lay.setSpacing(8)
 
-        inventory_title = QLabel("Product Inventory")
+        inventory_title = QLabel("Sales Inventory")
         inventory_title.setStyleSheet(label_style(11, "on_surface", "bold", FONT_HEADLINE, 1))
         inventory_lay.addWidget(inventory_title)
 
@@ -3707,6 +3791,7 @@ class SalesPage(QWidget):
         lay.addWidget(inventory_card)
 
         report_card = QFrame()
+        self.report_card = report_card
         report_card.setStyleSheet(card_style("surface_container"))
         report_lay = QVBoxLayout(report_card)
         report_lay.setContentsMargins(14, 12, 14, 12)
@@ -3740,6 +3825,29 @@ class SalesPage(QWidget):
         self.sales_table.setStyleSheet(self.inventory_table.styleSheet())
         report_lay.addWidget(self.sales_table)
         lay.addWidget(report_card)
+
+        self._apply_mode_visibility()
+
+    def _apply_mode_visibility(self):
+        if self.mode == "add":
+            self.sales_card.setVisible(True)
+            self.inventory_card.setVisible(False)
+            self.report_card.setVisible(False)
+            return
+        if self.mode == "inventory":
+            self.sales_card.setVisible(False)
+            self.inventory_card.setVisible(True)
+            self.report_card.setVisible(False)
+            return
+        if self.mode == "report":
+            self.sales_card.setVisible(False)
+            self.inventory_card.setVisible(False)
+            self.report_card.setVisible(True)
+            return
+
+        self.sales_card.setVisible(True)
+        self.inventory_card.setVisible(True)
+        self.report_card.setVisible(True)
 
     def _save_product(self):
         success, message = self.db.add_or_update_product(
@@ -4708,9 +4816,19 @@ class MainWindow(QMainWindow):
             RecordUserPage(self.db),
             RegisterPage(self.db),
             QRCheckInPage(self.db),
-            ReportsPage(),
+            SalesPage(self.db, "add"),
+            SalesPage(self.db, "inventory"),
+            SalesPage(self.db, "report"),
         ]
-        page_titles = ["Command Center", "Record User", "Register Protocol", "Daily Check-In", "Performance Intelligence"]
+        page_titles = [
+            "Command Center",
+            "Record User",
+            "Register Protocol",
+            "Daily Check-In",
+            "Adding Sales",
+            "Sales Inventory",
+            "Sales Report",
+        ]
         for p in self.pages:
             self.page_stack.addWidget(p)
         
@@ -4741,6 +4859,8 @@ class MainWindow(QMainWindow):
             self.pages[0].update_stats()
         if idx == 1:
             self.pages[1].refresh_records()
+        if idx in (4, 5, 6):
+            self.pages[idx].refresh_data()
 
     def _on_logout(self):
         """Handle logout - return to login page"""
